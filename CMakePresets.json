@@ -1,0 +1,61 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "clang-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "/nix/opt/llvm/22/bin/clang",
+        "CMAKE_CXX_COMPILER": "/nix/opt/llvm/22/bin/clang++"
+      }
+    },
+    {
+      "name": "debug",
+      "inherits": "clang-base",
+      "binaryDir": "${sourceDir}/build/cmake-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "FETCHCONTENT_SOURCE_DIR_RSTD": "${sourceDir}/../rstd"
+      }
+    },
+    {
+      "name": "debug-pinned",
+      "inherits": "clang-base",
+      "binaryDir": "${sourceDir}/build/cmake-debug-pinned",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "targets": ["luato.contract"],
+      "jobs": 2
+    },
+    {
+      "name": "debug-pinned",
+      "configurePreset": "debug-pinned",
+      "targets": ["luato.contract"],
+      "jobs": 2
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "debug-pinned",
+      "configurePreset": "debug-pinned",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}
