@@ -1,14 +1,8 @@
-module;
-
-extern "C" {
-#include <lauxlib.h>
-#include <lua.h>
-#include <lualib.h>
-}
-
 export module luato:state;
 
 export import :binding;
+
+import lua;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;

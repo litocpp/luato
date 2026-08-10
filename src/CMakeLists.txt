@@ -38,6 +38,8 @@ target_include_directories(luato.lua-runtime PRIVATE ${lua_SOURCE_DIR}/src)
 target_compile_definitions(luato.lua-runtime PRIVATE LUA_USE_LINUX)
 target_link_libraries(luato.lua-runtime PUBLIC ${CMAKE_DL_LIBS} m)
 
+add_subdirectory(ffi/lua)
+
 add_library(luato.lib STATIC)
 add_library(luato::luato ALIAS luato.lib)
 target_compile_features(luato.lib PUBLIC cxx_std_20)
@@ -53,8 +55,7 @@ if(NOT luato_IS_TOP_LEVEL)
             "$<$<COMPILE_LANGUAGE:CXX>:-Wunknown-attributes>"
             "$<$<COMPILE_LANGUAGE:CXX>:-fsized-deallocation>")
 endif()
-target_link_libraries(luato.lib PUBLIC rstd::rstd PRIVATE luato.lua-runtime)
-target_include_directories(luato.lib PRIVATE ${lua_SOURCE_DIR}/src)
+target_link_libraries(luato.lib PUBLIC rstd::rstd luato::ffi::lua)
 target_sources(
   luato.lib
   PUBLIC FILE_SET

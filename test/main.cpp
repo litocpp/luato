@@ -42,6 +42,20 @@ auto fixture(ref<str> name) -> rstd::path::PathBuf {
     return result;
 }
 
+void expect_lua_ffi(Checks& checks) {
+    checks.expect(LUA_VERSION_NUM == 505, "Lua FFI should export version constants");
+
+    auto* state = luaL_newstate();
+    checks.expect(state != nullptr, "Lua FFI should create a state");
+    if (state == nullptr) return;
+
+    lua_pushliteral(state, "ffi");
+    checks.expect(lua_isstring(state, -1), "Lua FFI should export stack helpers");
+    checks.expect(lua_gettop(state) == 1, "Lua FFI should expose the Lua stack");
+    lua_pop(state, 1);
+    lua_close(state);
+}
+
 void expect_script_error(Checks&               checks,
                          luato::State&         state,
                          ref<rstd::path::Path> path,
@@ -70,6 +84,8 @@ int main() {
     int    callback_drops {};
     int    invocation_drops {};
     int    rejected_callback_drops {};
+
+    expect_lua_ffi(checks);
 
     {
         auto minimal = luato::State::create(luato::StateOptions::none());
