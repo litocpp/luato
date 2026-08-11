@@ -108,6 +108,7 @@ int main() {
         }
 
         auto host = luato::ModuleSpec(String::make("host"_str));
+        host.set(String::make("profile"_str), String::make("debug"_str));
         host.add(luato::NativeFunctionSpec::make(
             String::make("add"_str),
             usize(2),
@@ -143,6 +144,61 @@ int main() {
                                                 frame.push(true);
                                                 return Ok(usize(1));
                                             }));
+        host.add(luato::NativeFunctionSpec::make(
+            String::make("invert"_str), usize(1),
+            [](luato::CallFrame &frame) -> luato::BindingResult {
+              auto value = frame.required<bool>(usize{});
+              if (value.is_err())
+                return Err(rstd::move(value).unwrap_err_unchecked());
+              frame.push(!rstd::move(value).unwrap_unchecked());
+              return Ok(usize(1));
+            }));
+        host.add(luato::NativeFunctionSpec::make(
+            String::make("configure"_str), usize(1),
+            [](luato::CallFrame &frame) -> luato::BindingResult {
+              auto request = frame.required<luato::Table>(usize{});
+              if (request.is_err())
+                return Err(rstd::move(request).unwrap_err_unchecked());
+              auto table = rstd::move(request).unwrap_unchecked();
+
+              auto known = Vec<String>::make();
+              known.push(String::make("package"_str));
+              known.push(String::make("enabled"_str));
+              known.push(String::make("values"_str));
+              auto checked = table.reject_unknown_fields(known.as_slice());
+              if (checked.is_err())
+                return Err(rstd::move(checked).unwrap_err_unchecked());
+
+              auto package = table.required<String>("package"_str);
+              if (package.is_err())
+                return Err(rstd::move(package).unwrap_err_unchecked());
+              auto enabled = table.required<bool>("enabled"_str);
+              if (enabled.is_err())
+                return Err(rstd::move(enabled).unwrap_err_unchecked());
+              auto values = table.required<luato::Table>("values"_str);
+              if (values.is_err())
+                return Err(rstd::move(values).unwrap_err_unchecked());
+              auto scalars = values->scalar_entries();
+              if (scalars.is_err())
+                return Err(rstd::move(scalars).unwrap_err_unchecked());
+              if (scalars->len() != usize(3)) {
+                return Err(luato::Error::binding(String::make(
+                    "values should contain three scalar fields"_str)));
+              }
+
+              auto result = luato::Table::make();
+              auto inserted =
+                  result.set(String::make("output"_str),
+                             rstd::move(package).unwrap_unchecked());
+              if (inserted.is_err())
+                return Err(rstd::move(inserted).unwrap_err_unchecked());
+              inserted = result.set(String::make("changed"_str),
+                                    rstd::move(enabled).unwrap_unchecked());
+              if (inserted.is_err())
+                return Err(rstd::move(inserted).unwrap_err_unchecked());
+              frame.push(rstd::move(result));
+              return Ok(usize(1));
+            }));
         host.add(luato::NativeFunctionSpec::make(
             String::make("fail"_str),
             usize(1),
@@ -183,6 +239,11 @@ int main() {
         auto native_add = fixture("native-add.lua"_str);
         auto success    = state.execute_file(native_add.as_path());
         checks.expect(success.is_ok(), "native add fixture should pass");
+
+        auto structured = fixture("structured.lua"_str);
+        auto structured_result = state.execute_file(structured.as_path());
+        checks.expect(structured_result.is_ok(),
+                      "structured binding fixture should pass");
 
         auto missing = fixture("missing.lua"_str);
         expect_script_error(checks,
@@ -245,6 +306,30 @@ int main() {
 
         auto after_binding = state.execute_file(native_add.as_path());
         checks.expect(after_binding.is_ok(), "state should remain usable after binding errors");
+
+        auto unknown_field = fixture("structured-unknown-field.lua"_str);
+        expect_script_error(checks, state, unknown_field.as_path(),
+                            luato::ErrorKind::Binding, "host.configure"_str,
+                            "host.configure argument 1.extra"_str,
+                            "structured-unknown-field.lua"_str);
+
+        auto invalid_scalar = fixture("structured-invalid-scalar.lua"_str);
+        expect_script_error(checks, state, invalid_scalar.as_path(),
+                            luato::ErrorKind::Type, "host.configure"_str,
+                            "host.configure argument 1.values.NESTED"_str,
+                            "structured-invalid-scalar.lua"_str);
+
+        auto invalid_key = fixture("structured-invalid-key.lua"_str);
+        expect_script_error(
+            checks, state, invalid_key.as_path(), luato::ErrorKind::Type,
+            "host.configure"_str,
+            "host.configure argument 1.values keys must be strings"_str,
+            "structured-invalid-key.lua"_str);
+
+        auto after_structured_errors = state.execute_file(structured.as_path());
+        checks.expect(
+            after_structured_errors.is_ok(),
+            "state should remain usable after structured binding errors");
     }
 
     checks.expect(callback_drops == 2, "state should destroy each callback context exactly once");

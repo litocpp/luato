@@ -61,59 +61,18 @@ private:
 namespace luato
 {
 
-enum class PendingValueKind
-{
-    Integer,
-    Boolean,
-    String,
-};
-
-struct PendingValue {
-    PendingValueKind kind { PendingValueKind::Integer };
-    i64              integer {};
-    bool             boolean { false };
-    String           string {};
-
-    PendingValue() noexcept                          = default;
-    PendingValue(PendingValue&&) noexcept            = default;
-    PendingValue& operator=(PendingValue&&) noexcept = default;
-
-    static auto from_integer(i64 value) -> PendingValue {
-        PendingValue result;
-        result.kind    = PendingValueKind::Integer;
-        result.integer = value;
-        return result;
-    }
-
-    static auto from_boolean(bool value) -> PendingValue {
-        PendingValue result;
-        result.kind    = PendingValueKind::Boolean;
-        result.boolean = value;
-        return result;
-    }
-
-    static auto from_string(String value) -> PendingValue {
-        PendingValue result;
-        result.kind   = PendingValueKind::String;
-        result.string = rstd::move(value);
-        return result;
-    }
-};
-
 struct CallbackSlot {
     String              name;
     String              source;
     usize               arity;
     Box<NativeCallback> callback;
-    Vec<PendingValue>   returns;
+    Vec<Value> returns;
     Option<Error>       pending_error;
 
-    CallbackSlot(String name, String source, usize arity, Box<NativeCallback> callback)
-        : name(rstd::move(name)),
-          source(rstd::move(source)),
-          arity(arity),
-          callback(rstd::move(callback)),
-          returns(Vec<PendingValue>::make()),
+    CallbackSlot(String name, String source, usize arity,
+                 Box<NativeCallback> callback)
+        : name(rstd::move(name)), source(rstd::move(source)), arity(arity),
+          callback(rstd::move(callback)), returns(Vec<Value>::make()),
           pending_error(None()) {}
 };
 
@@ -138,6 +97,8 @@ struct Invocation {
 struct RegistrationRequest {
     StateStorage* storage;
     String const* module_name;
+    TableEntry const *fields;
+    usize field_count;
     usize         first_slot;
     usize         slot_count;
     lua_CFunction dispatcher;
@@ -173,6 +134,42 @@ auto copied_lua_string(lua_State* state, int index, ref<str> fallback) -> String
 void push_string(lua_State* state, String const& value) {
     auto view = value.as_str();
     lua_pushlstring(state, reinterpret_cast<char const*>(view.data()), view.len().to_primitive());
+}
+
+auto push_value(lua_State *state, const Value &value) -> bool {
+  if (!lua_checkstack(state, 3))
+    return false;
+  switch (value.tag()) {
+  case Value::Tag::Integer:
+    lua_pushinteger(
+        state, static_cast<lua_Integer>(value.as_Integer().value.to_primitive()));
+    return true;
+  case Value::Tag::Boolean:
+    lua_pushboolean(state, value.as_Boolean().value);
+    return true;
+  case Value::Tag::String: {
+    auto text = value.as_String().value.as_str();
+    lua_pushlstring(state, reinterpret_cast<char const *>(text.data()),
+                    text.len().to_primitive());
+    return true;
+  }
+  case Value::Tag::Table: {
+    const auto &table = value.as_Table().value;
+    auto count = rstd::try_from<int>(table->entries().len());
+    if (count.is_err())
+      return false;
+    lua_createtable(state, 0, rstd::move(count).unwrap_unchecked());
+    auto output = lua_gettop(state);
+    for (const auto &entry : table->entries()) {
+      push_string(state, entry.key);
+      if (!push_value(state, entry.value))
+        return false;
+      lua_rawset(state, output);
+    }
+    return true;
+  }
+  }
+  return false;
 }
 
 auto error_kind_from_integer(lua_Integer value, ErrorKind fallback) noexcept -> ErrorKind {
@@ -271,8 +268,21 @@ int bootstrap_state(lua_State* state) {
 
 int register_module(lua_State* state) {
     auto* request = static_cast<RegistrationRequest*>(lua_touserdata(state, 1));
-    lua_createtable(state, 0, static_cast<int>(request->slot_count.to_primitive()));
+    auto field_capacity = request->slot_count + request->field_count;
+    auto capacity = rstd::try_from<int>(field_capacity);
+    if (capacity.is_err())
+      return luaL_error(state, "module has too many fields");
+    lua_createtable(state, 0, rstd::move(capacity).unwrap_unchecked());
     auto module = lua_gettop(state);
+
+    for (auto index = usize(); index < request->field_count; ++index) {
+      auto &field = request->fields[index.to_primitive()];
+      push_string(state, field.key);
+      if (!push_value(state, field.value)) {
+        return luaL_error(state, "Lua module value stack allocation failed");
+      }
+      lua_rawset(state, module);
+    }
 
     for (auto offset = usize(); offset < request->slot_count; ++offset) {
         auto* slot = request->storage->callbacks[request->first_slot + offset].get();
@@ -315,6 +325,16 @@ auto read_i64(void* context, usize index) -> Result<i64> {
     return Ok(rstd::move(value).unwrap_unchecked());
 }
 
+auto read_bool(void *context, usize index) -> Result<bool> {
+  auto *invocation = static_cast<Invocation *>(context);
+  auto lua_index = static_cast<int>(index.to_primitive() + 1);
+  if (index >= usize(lua_gettop(invocation->lua)) ||
+      lua_type(invocation->lua, lua_index) != LUA_TBOOLEAN) {
+    return Err(invocation_type_error(invocation, index, "a boolean"_str));
+  }
+  return Ok(lua_toboolean(invocation->lua, lua_index) != 0);
+}
+
 auto read_string(void* context, usize index) -> Result<String> {
     auto* invocation = static_cast<Invocation*>(context);
     auto  lua_index  = static_cast<int>(index.to_primitive() + 1);
@@ -332,19 +352,176 @@ auto read_string(void* context, usize index) -> Result<String> {
     return Ok(value.take().unwrap_unchecked());
 }
 
-void stage_i64(void* context, i64 value) {
-    auto* invocation = static_cast<Invocation*>(context);
-    invocation->slot->returns.push(PendingValue::from_integer(value));
+auto lua_type_name(lua_State *state, int index) noexcept -> ref<str> {
+  switch (lua_type(state, index)) {
+  case LUA_TNIL:
+    return "nil"_str;
+  case LUA_TBOOLEAN:
+    return "boolean"_str;
+  case LUA_TLIGHTUSERDATA:
+    return "light userdata"_str;
+  case LUA_TNUMBER:
+    return lua_isinteger(state, index) ? "integer"_str : "number"_str;
+  case LUA_TSTRING:
+    return "string"_str;
+  case LUA_TTABLE:
+    return "table"_str;
+  case LUA_TFUNCTION:
+    return "function"_str;
+  case LUA_TUSERDATA:
+    return "userdata"_str;
+  case LUA_TTHREAD:
+    return "thread"_str;
+  default:
+    return "unknown"_str;
+  }
 }
 
-void stage_bool(void* context, bool value) {
-    auto* invocation = static_cast<Invocation*>(context);
-    invocation->slot->returns.push(PendingValue::from_boolean(value));
+auto value_type_error(Invocation *invocation, ref<str> path, ref<str> expected,
+                      int lua_index) -> Error {
+  return Error::make(ErrorKind::Type, invocation->slot->source.clone(),
+                     rstd::format("{} must be {}, received {}", path, expected,
+                                  lua_type_name(invocation->lua, lua_index)));
 }
 
-void stage_string(void* context, String value) {
-    auto* invocation = static_cast<Invocation*>(context);
-    invocation->slot->returns.push(PendingValue::from_string(rstd::move(value)));
+auto decode_value(Invocation *invocation, int lua_index, String path,
+                  Vec<const void *> &ancestors, usize depth) -> Result<Value>;
+
+auto decode_table(Invocation *invocation, int lua_index, String path,
+                  Vec<const void *> &ancestors, usize depth) -> Result<Table> {
+  auto *lua = invocation->lua;
+  if (lua_type(lua, lua_index) != LUA_TTABLE) {
+    return Err(
+        value_type_error(invocation, path.as_str(), "a table"_str, lua_index));
+  }
+  if (depth >= usize(32)) {
+    return Err(Error::make(
+        ErrorKind::Type, invocation->slot->source.clone(),
+        rstd::format("{} exceeds the maximum table depth", path.as_str())));
+  }
+
+  auto identity = lua_topointer(lua, lua_index);
+  for (auto ancestor : ancestors) {
+    if (ancestor != identity)
+      continue;
+    return Err(
+        Error::make(ErrorKind::Type, invocation->slot->source.clone(),
+                    rstd::format("{} contains a table cycle", path.as_str())));
+  }
+
+  auto absolute = lua_absindex(lua, lua_index);
+  auto old_top = lua_gettop(lua);
+  auto entries = Vec<TableEntry>::make();
+  ancestors.push(rstd::move(identity));
+  lua_pushnil(lua);
+  while (lua_next(lua, absolute) != 0) {
+    if (lua_type(lua, -2) != LUA_TSTRING) {
+      lua_settop(lua, old_top);
+      (void)ancestors.pop();
+      return Err(
+          Error::make(ErrorKind::Type, invocation->slot->source.clone(),
+                      rstd::format("{} keys must be strings", path.as_str())));
+    }
+
+    size_t key_length{};
+    char const *key_bytes = lua_tolstring(lua, -2, &key_length);
+    auto key = copied_utf8(key_bytes, key_length);
+    if (key.is_none()) {
+      lua_settop(lua, old_top);
+      (void)ancestors.pop();
+      return Err(Error::make(
+          ErrorKind::Type, invocation->slot->source.clone(),
+          rstd::format("{} contains a non-UTF-8 key", path.as_str())));
+    }
+
+    auto owned_key = key.take().unwrap_unchecked();
+    auto child_path = rstd::format("{}.{}", path.as_str(), owned_key.as_str());
+    auto decoded = decode_value(invocation, -1, rstd::move(child_path),
+                                ancestors, depth + usize(1));
+    if (decoded.is_err()) {
+      auto error = rstd::move(decoded).unwrap_err_unchecked();
+      lua_settop(lua, old_top);
+      (void)ancestors.pop();
+      return Err(rstd::move(error));
+    }
+    entries.push(TableEntry{rstd::move(owned_key),
+                            rstd::move(decoded).unwrap_unchecked()});
+    lua_pop(lua, 1);
+  }
+  (void)ancestors.pop();
+
+  for (auto index = usize(1); index < entries.len(); ++index) {
+    auto cursor = index;
+    while (cursor > usize() &&
+           entries[cursor].key < entries[cursor - usize(1)].key) {
+      auto previous = cursor - usize(1);
+      auto moved = rstd::move(entries[cursor]);
+      entries[cursor] = rstd::move(entries[previous]);
+      entries[previous] = rstd::move(moved);
+      --cursor;
+    }
+  }
+  return Ok(Table::with_path(rstd::move(path), rstd::move(entries)));
+}
+
+auto decode_value(Invocation *invocation, int lua_index, String path,
+                  Vec<const void *> &ancestors, usize depth) -> Result<Value> {
+  auto *lua = invocation->lua;
+  switch (lua_type(lua, lua_index)) {
+  case LUA_TNUMBER: {
+    if (!lua_isinteger(lua, lua_index)) {
+      return Err(value_type_error(invocation, path.as_str(), "an integer"_str,
+                                  lua_index));
+    }
+    auto value = rstd::try_from<i64>(lua_tointeger(lua, lua_index));
+    if (value.is_err()) {
+      return Err(value_type_error(invocation, path.as_str(),
+                                  "an i64 integer"_str, lua_index));
+    }
+    return Ok(Value::Integer(rstd::move(value).unwrap_unchecked()));
+  }
+  case LUA_TBOOLEAN:
+    return Ok(Value::Boolean(lua_toboolean(lua, lua_index) != 0));
+  case LUA_TSTRING: {
+    size_t length{};
+    char const *bytes = lua_tolstring(lua, lua_index, &length);
+    auto value = copied_utf8(bytes, length);
+    if (value.is_none()) {
+      return Err(value_type_error(invocation, path.as_str(),
+                                  "a UTF-8 string"_str, lua_index));
+    }
+    return Ok(Value::String(value.take().unwrap_unchecked()));
+  }
+  case LUA_TTABLE: {
+    auto value =
+        decode_table(invocation, lua_index, rstd::move(path), ancestors, depth);
+    if (value.is_err())
+      return Err(rstd::move(value).unwrap_err_unchecked());
+    return Ok(Value::Table(rstd::move(value).unwrap_unchecked()));
+  }
+  default:
+    return Err(value_type_error(invocation, path.as_str(),
+                                "an integer, boolean, string, or table"_str,
+                                lua_index));
+  }
+}
+
+auto read_table(void *context, usize index) -> Result<Table> {
+  auto *invocation = static_cast<Invocation *>(context);
+  auto lua_index = static_cast<int>(index.to_primitive() + 1);
+  if (index >= usize(lua_gettop(invocation->lua))) {
+    return Err(invocation_type_error(invocation, index, "a table"_str));
+  }
+  auto ancestors = Vec<const void *>::make();
+  auto path = rstd::format("{} argument {}", invocation->slot->source.as_str(),
+                           index + usize(1));
+  return decode_table(invocation, lua_index, rstd::move(path), ancestors,
+                      usize());
+}
+
+void stage_value(void *context, Value value) {
+  auto *invocation = static_cast<Invocation *>(context);
+  invocation->slot->returns.push(rstd::move(value));
 }
 
 int raise_pending_error(lua_State* state, CallbackSlot* slot) {
@@ -366,14 +543,15 @@ int raise_pending_error(lua_State* state, CallbackSlot* slot) {
 
 int push_pending_values(lua_State* state, CallbackSlot* slot, int result_count) {
     for (auto index = usize(); index < slot->returns.len(); ++index) {
-        auto* value = rstd::addressof(slot->returns[index]);
-        switch (value->kind) {
-        case PendingValueKind::Integer:
-            lua_pushinteger(state, static_cast<lua_Integer>(value->integer.to_primitive()));
-            break;
-        case PendingValueKind::Boolean: lua_pushboolean(state, value->boolean); break;
-        case PendingValueKind::String: push_string(state, value->string); break;
-        }
+      if (push_value(state, slot->returns[index]))
+        continue;
+      slot->pending_error = Some(Error{
+          ErrorKind::Memory,
+          slot->source.clone(),
+          String::make("Lua result stack allocation failed"_str),
+          String::make(),
+      });
+      return raise_pending_error(state, slot);
     }
     return result_count;
 }
@@ -486,6 +664,30 @@ auto State::register_module(ModuleSpec module) -> Result<empty> {
             }
         }
     }
+    for (auto index = usize(); index < module.fields_.len(); ++index) {
+      auto &field = module.fields_[index];
+      if (field.key.is_empty()) {
+        return Err(
+            Error::make(ErrorKind::Binding, module.name_.clone(),
+                        String::make("module field name cannot be empty"_str)));
+      }
+      for (auto other = usize(); other < index; ++other) {
+        if (module.fields_[other].key != field.key.as_str())
+          continue;
+        return Err(Error::make(ErrorKind::Binding, module.name_.clone(),
+                               rstd::format("duplicate module field '{}.{}'",
+                                            module.name_.as_str(),
+                                            field.key.as_str())));
+      }
+      for (const auto &function : module.functions_) {
+        if (function.name_ != field.key.as_str())
+          continue;
+        return Err(Error::make(ErrorKind::Binding, module.name_.clone(),
+                               rstd::format("duplicate module member '{}.{}'",
+                                            module.name_.as_str(),
+                                            field.key.as_str())));
+      }
+    }
 
     auto first_slot = storage->callbacks.len();
     for (auto index = usize(); index < module.functions_.len(); ++index) {
@@ -500,9 +702,13 @@ auto State::register_module(ModuleSpec module) -> Result<empty> {
     auto dispatcher = +[](lua_State* state) -> int {
         return State::dispatch(static_cast<void*>(state));
     };
-    auto request = RegistrationRequest {
-        storage, rstd::addressof(module.name_), first_slot, module.functions_.len(), dispatcher
-    };
+    auto request = RegistrationRequest{storage,
+                                       rstd::addressof(module.name_),
+                                       module.fields_.data(),
+                                       module.fields_.len(),
+                                       first_slot,
+                                       module.functions_.len(),
+                                       dispatcher};
 
     if (! lua_checkstack(lua, 2)) {
         storage->callbacks.truncate(first_slot);
@@ -549,13 +755,9 @@ int State::dispatch(void* lua_state) {
     usize result_count {};
     {
         auto invocation = Invocation { lua, slot };
-        auto frame      = CallFrame(static_cast<void*>(rstd::addressof(invocation)),
-                                    actual,
-                                    read_i64,
-                                    read_string,
-                                    stage_i64,
-                                    stage_bool,
-                                    stage_string);
+        auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
+                               actual, read_i64, read_bool, read_string,
+                               read_table, stage_value);
         auto result     = slot->callback->operator()(frame);
         if (result.is_err()) {
             auto error = rstd::move(result).unwrap_err_unchecked();
