@@ -1,0 +1,36 @@
+[package]
+name = "luato"
+version = "0.1.0"
+
+[lib]
+name = "luato"
+module = "luato"
+archive = "luato"
+discovery = "module"
+
+[[test]]
+name = "luato-contract"
+discovery = "explicit"
+sources = ["tests/main.cpp"]
+
+[usage]
+private-definitions = [
+  "LUA_USE_LINUX",
+  "LUATO_FIXTURE_DIR=\"tests/fixtures\"",
+]
+
+[profile]
+exceptions = false
+rtti = false
+
+[dependencies.rstd-std]
+git = "https://github.com/litocpp/rstd.git"
+visibility = "public"
+
+[external-dependencies.cmake.lua]
+find-package = "Lua"
+archive = "https://www.lua.org/ftp/lua-5.5.0.tar.gz"
+sha256 = "57ccc32bbbd005cab75bcc52444052535af691789dba2b9016d5c50640d68b3d"
+integration = "build-tree"
+adapter = "cmake/lua.cmake"
+targets = [{ name = "Lua::Lua", visibility = "public" }]

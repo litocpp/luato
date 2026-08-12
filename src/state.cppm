@@ -2,7 +2,7 @@ export module luato:state;
 
 export import :binding;
 
-import lua;
+import :ffi.lua;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;

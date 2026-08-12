@@ -6,7 +6,7 @@ extern "C" {
 #include <lualib.h>
 }
 
-export module lua:types;
+export module luato:ffi.lua.types;
 
 export {
     using ::lua_Alloc;

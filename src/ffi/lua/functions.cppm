@@ -58,10 +58,10 @@ extern "C" {
 #undef luaL_prepbuffer
 #undef luaL_openlibs
 
-export module lua:functions;
+export module luato:ffi.lua.functions;
 
-export import :constants;
-export import :types;
+export import :ffi.lua.constants;
+export import :ffi.lua.types;
 
 export {
     using ::lua_absindex;

@@ -239,7 +239,7 @@ inline constexpr auto maximum_unsigned       = LUA_MAXUNSIGNED;
 #undef LUA_MININTEGER
 #undef LUA_MAXUNSIGNED
 
-export module lua:constants;
+export module luato:ffi.lua.constants;
 
 export {
     inline constexpr auto LUA_VERSION_MAJOR_N     = luato_lua_ffi::version_major_n;

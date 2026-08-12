@@ -20,7 +20,7 @@ target_sources(
          TYPE
          CXX_MODULES
          FILES
-         lua.cppm
+         mod.cppm
          types.cppm
          constants.cppm
          functions.cppm)
