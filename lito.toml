@@ -6,11 +6,9 @@ version = "0.1.0"
 name = "luato"
 module = "luato"
 archive = "luato"
-discovery = "module"
 
 [[test]]
 name = "luato-contract"
-discovery = "explicit"
 sources = ["tests/main.cpp"]
 
 [usage]
