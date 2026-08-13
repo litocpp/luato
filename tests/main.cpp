@@ -200,6 +200,31 @@ int main() {
               return Ok(usize(1));
             }));
         host.add(luato::NativeFunctionSpec::make(
+            String::make("collect"_str), usize(1),
+            [](luato::CallFrame &frame) -> luato::BindingResult {
+              auto input = frame.required<luato::Array>(usize{});
+              if (input.is_err())
+                return Err(rstd::move(input).unwrap_err_unchecked());
+              auto values = rstd::move(input).unwrap_unchecked();
+              if (values.len() != usize(2)) {
+                return Err(luato::Error::binding(
+                    String::make("collect expects two entries"_str)));
+              }
+              auto total = i64{};
+              for (const auto &value : values.values()) {
+                if (!value.is_Table()) {
+                  return Err(luato::Error::binding(
+                      String::make("collect entries must be tables"_str)));
+                }
+                auto amount = value.as_Table().value->required<i64>("amount"_str);
+                if (amount.is_err())
+                  return Err(rstd::move(amount).unwrap_err_unchecked());
+                total += rstd::move(amount).unwrap_unchecked();
+              }
+              frame.push(total);
+              return Ok(usize(1));
+            }));
+        host.add(luato::NativeFunctionSpec::make(
             String::make("fail"_str),
             usize(1),
             [lifetime = DropProbe(callback_drops),
@@ -244,6 +269,11 @@ int main() {
         auto structured_result = state.execute_file(structured.as_path());
         checks.expect(structured_result.is_ok(),
                       "structured binding fixture should pass");
+
+        auto structured_array = fixture("structured-array.lua"_str);
+        auto structured_array_result = state.execute_file(structured_array.as_path());
+        checks.expect(structured_array_result.is_ok(),
+                      "structured array binding fixture should pass");
 
         auto missing = fixture("missing.lua"_str);
         expect_script_error(checks,
@@ -323,7 +353,7 @@ int main() {
         expect_script_error(
             checks, state, invalid_key.as_path(), luato::ErrorKind::Type,
             "host.configure"_str,
-            "host.configure argument 1.values keys must be strings"_str,
+            "host.configure argument 1.values must be a table, received array"_str,
             "structured-invalid-key.lua"_str);
 
         auto after_structured_errors = state.execute_file(structured.as_path());

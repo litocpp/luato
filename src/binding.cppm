@@ -13,13 +13,15 @@ export namespace luato
 
 class State;
 class Table;
+class Array;
 
 class Value {
   RSTD_ENUM(Value,
             (Integer, (i64 value;)),
             (Boolean, (bool value;)),
             (String, (::alloc::string::String value;)),
-            (Table, (Box<luato::Table> value;)))
+            (Table, (Box<luato::Table> value;)),
+            (Array, (Box<luato::Array> value;)))
 
 public:
   Value(const Value &) = delete;
@@ -28,9 +30,29 @@ public:
   auto operator=(Value &&) noexcept -> Value & = default;
 
   static auto Table(luato::Table value) -> Value;
+  static auto Array(luato::Array value) -> Value;
 
   auto type_name() const noexcept -> ref<str>;
   auto clone() const -> Value;
+};
+
+class Array {
+public:
+  static auto make() -> Array { return Array(Vec<Value>::make()); }
+
+  static auto from(Vec<Value> values) -> Array {
+    return Array(rstd::move(values));
+  }
+
+  auto values() const noexcept -> slice<Value> { return values_.as_slice(); }
+  auto len() const noexcept -> usize { return values_.len(); }
+  auto is_empty() const noexcept -> bool { return values_.is_empty(); }
+  auto clone() const -> Array;
+
+private:
+  explicit Array(Vec<Value> values) : values_(rstd::move(values)) {}
+
+  Vec<Value> values_;
 };
 
 struct TableEntry {
@@ -75,6 +97,9 @@ public:
   auto entries() const noexcept -> slice<TableEntry> {
     return entries_.as_slice();
   }
+  auto contains(ref<str> key) const noexcept -> bool {
+    return lookup(key) != nullptr;
+  }
   auto clone() const -> Table;
 
   auto insert(String key, Value value) -> Result<empty>;
@@ -90,10 +115,14 @@ public:
   auto set(String key, Table value) -> Result<empty> {
     return insert(rstd::move(key), Value::Table(rstd::move(value)));
   }
+  auto set(String key, Array value) -> Result<empty> {
+    return insert(rstd::move(key), Value::Array(rstd::move(value)));
+  }
 
   template <typename T>
     requires(rstd::mtp::same_as<T, i64> || rstd::mtp::same_as<T, bool> ||
-             rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table>)
+             rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table> ||
+             rstd::mtp::same_as<T, Array>)
   auto required(ref<str> key) const -> Result<T> {
     auto *value = lookup(key);
     if (value == nullptr) {
@@ -114,10 +143,14 @@ public:
       if (value->is_String())
         return Ok(value->as_String().value.clone());
       return Err(field_type_error(key, "a string"_str, *value));
-    } else {
+    } else if constexpr (rstd::mtp::same_as<T, Table>) {
       if (value->is_Table())
         return Ok(value->as_Table().value->clone());
       return Err(field_type_error(key, "a table"_str, *value));
+    } else {
+      if (value->is_Array())
+        return Ok(value->as_Array().value->clone());
+      return Err(field_type_error(key, "an array"_str, *value));
     }
   }
 
@@ -141,6 +174,17 @@ inline auto Value::Table(luato::Table value) -> Value {
   return Value::Table(Box<luato::Table>::make(rstd::move(value)));
 }
 
+inline auto Value::Array(luato::Array value) -> Value {
+  return Value::Array(Box<luato::Array>::make(rstd::move(value)));
+}
+
+inline auto Array::clone() const -> Array {
+  auto copied = Vec<Value>::with_capacity(values_.len());
+  for (const auto &value : values_)
+    copied.push(value.clone());
+  return Array(rstd::move(copied));
+}
+
 inline auto Value::type_name() const noexcept -> ref<str> {
   switch (tag()) {
   case Tag::Integer:
@@ -151,6 +195,8 @@ inline auto Value::type_name() const noexcept -> ref<str> {
     return "string"_str;
   case Tag::Table:
     return "table"_str;
+  case Tag::Array:
+    return "array"_str;
   }
   return "unknown"_str;
 }
@@ -165,6 +211,8 @@ inline auto Value::clone() const -> Value {
     return String(as_String().value.clone());
   case Tag::Table:
     return Table(Box<luato::Table>::make(as_Table().value->clone()));
+  case Tag::Array:
+    return Array(Box<luato::Array>::make(as_Array().value->clone()));
   }
   rstd::panic { "invalid Luato value tag" };
 }
@@ -254,6 +302,10 @@ inline auto Table::scalar_entries() const -> Result<Vec<ScalarEntry>> {
       return Err(Error::make(
           ErrorKind::Type, String::make(),
           rstd::format("{} must be a scalar, received table", path.as_str())));
+    case Value::Tag::Array:
+      return Err(Error::make(
+          ErrorKind::Type, String::make(),
+          rstd::format("{} must be a scalar, received array", path.as_str())));
     }
   }
   return Ok(rstd::move(result));
@@ -268,7 +320,8 @@ public:
 
     template <typename T>
       requires(rstd::mtp::same_as<T, i64> || rstd::mtp::same_as<T, bool> ||
-               rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table>)
+               rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table> ||
+               rstd::mtp::same_as<T, Array>)
     auto required(usize index) -> Result<T> {
       if constexpr (rstd::mtp::same_as<T, i64>) {
         return read_i64_(context_, index);
@@ -276,8 +329,10 @@ public:
         return read_bool_(context_, index);
       } else if constexpr (rstd::mtp::same_as<T, String>) {
         return read_string_(context_, index);
-      } else {
+      } else if constexpr (rstd::mtp::same_as<T, Table>) {
         return read_table_(context_, index);
+      } else {
+        return read_array_(context_, index);
       }
     }
 
@@ -299,14 +354,16 @@ public:
     using ReadBool = auto (*)(void *, usize) -> Result<bool>;
     using ReadString = auto (*)(void*, usize) -> Result<String>;
     using ReadTable = auto (*)(void *, usize) -> Result<Table>;
+    using ReadArray = auto (*)(void *, usize) -> Result<Array>;
     using PushValue = void (*)(void *, Value);
 
     CallFrame(void *context, usize argument_count, ReadI64 read_i64,
               ReadBool read_bool, ReadString read_string, ReadTable read_table,
+              ReadArray read_array,
               PushValue push_value) noexcept
         : context_(context), argument_count_(argument_count),
           read_i64_(read_i64), read_bool_(read_bool), read_string_(read_string),
-          read_table_(read_table), push_value_(push_value) {}
+          read_table_(read_table), read_array_(read_array), push_value_(push_value) {}
 
     void*      context_;
     usize      argument_count_;
@@ -314,6 +371,7 @@ public:
     ReadBool read_bool_;
     ReadString read_string_;
     ReadTable read_table_;
+    ReadArray read_array_;
     PushValue push_value_;
 
     friend class State;
@@ -367,6 +425,9 @@ public:
   }
   void set(String name, Table value) {
     fields_.push(TableEntry{rstd::move(name), Value::Table(rstd::move(value))});
+  }
+  void set(String name, Array value) {
+    fields_.push(TableEntry{rstd::move(name), Value::Array(rstd::move(value))});
   }
 
 private:

@@ -168,6 +168,20 @@ auto push_value(lua_State *state, const Value &value) -> bool {
     }
     return true;
   }
+  case Value::Tag::Array: {
+    const auto &array = value.as_Array().value;
+    auto count = rstd::try_from<int>(array->len());
+    if (count.is_err())
+      return false;
+    lua_createtable(state, rstd::move(count).unwrap_unchecked(), 0);
+    auto output = lua_gettop(state);
+    for (auto index = usize(); index < array->len(); ++index) {
+      if (!push_value(state, array->values()[index]))
+        return false;
+      lua_rawseti(state, output, static_cast<lua_Integer>(index.to_primitive() + 1));
+    }
+    return true;
+  }
   }
   return false;
 }
@@ -387,6 +401,91 @@ auto value_type_error(Invocation *invocation, ref<str> path, ref<str> expected,
 auto decode_value(Invocation *invocation, int lua_index, String path,
                   Vec<const void *> &ancestors, usize depth) -> Result<Value>;
 
+auto dense_array_length(Invocation *invocation, int lua_index)
+    -> Result<Option<usize>> {
+  auto *lua = invocation->lua;
+  auto absolute = lua_absindex(lua, lua_index);
+  auto old_top = lua_gettop(lua);
+  auto count = usize();
+  auto maximum = usize();
+  auto has_string = false;
+  auto has_integer = false;
+  lua_pushnil(lua);
+  while (lua_next(lua, absolute) != 0) {
+    if (lua_type(lua, -2) == LUA_TSTRING) {
+      has_string = true;
+    } else if (lua_isinteger(lua, -2)) {
+      auto raw = lua_tointeger(lua, -2);
+      auto converted = rstd::try_from<usize>(raw);
+      if (converted.is_err() || *converted == usize()) {
+        lua_settop(lua, old_top);
+        return Err(Error::make(ErrorKind::Type,
+                               invocation->slot->source.clone(),
+                               String::make("array keys must be positive integers"_str)));
+      }
+      has_integer = true;
+      ++count;
+      if (maximum < *converted) maximum = *converted;
+    } else {
+      lua_settop(lua, old_top);
+      return Err(Error::make(ErrorKind::Type,
+                             invocation->slot->source.clone(),
+                             String::make("table keys must be strings or positive integers"_str)));
+    }
+    lua_pop(lua, 1);
+  }
+  if (has_string && has_integer) {
+    return Err(Error::make(ErrorKind::Type,
+                           invocation->slot->source.clone(),
+                           String::make("tables cannot mix string and integer keys"_str)));
+  }
+  if (!has_integer) return Ok(None());
+  if (count != maximum) {
+    return Err(Error::make(ErrorKind::Type,
+                           invocation->slot->source.clone(),
+                           String::make("array keys must be dense and start at one"_str)));
+  }
+  return Ok(Some(maximum));
+}
+
+auto decode_array(Invocation *invocation, int lua_index, String path,
+                  Vec<const void *> &ancestors, usize depth, usize length)
+    -> Result<Array> {
+  auto *lua = invocation->lua;
+  if (depth >= usize(32)) {
+    return Err(Error::make(ErrorKind::Type,
+                           invocation->slot->source.clone(),
+                           rstd::format("{} exceeds the maximum table depth", path.as_str())));
+  }
+  auto identity = lua_topointer(lua, lua_index);
+  for (auto ancestor : ancestors) {
+    if (ancestor == identity) {
+      return Err(Error::make(ErrorKind::Type,
+                             invocation->slot->source.clone(),
+                             rstd::format("{} contains a table cycle", path.as_str())));
+    }
+  }
+  auto absolute = lua_absindex(lua, lua_index);
+  ancestors.push(rstd::move(identity));
+  auto values = Vec<Value>::with_capacity(length);
+  for (auto index = usize(); index < length; ++index) {
+    lua_rawgeti(lua, absolute, static_cast<lua_Integer>(index.to_primitive() + 1));
+    auto decoded = decode_value(invocation,
+                                -1,
+                                rstd::format("{}[{}]", path.as_str(), index + usize(1)),
+                                ancestors,
+                                depth + usize(1));
+    lua_pop(lua, 1);
+    if (decoded.is_err()) {
+      (void)ancestors.pop();
+      return Err(rstd::move(decoded).unwrap_err_unchecked());
+    }
+    values.push(rstd::move(decoded).unwrap_unchecked());
+  }
+  (void)ancestors.pop();
+  return Ok(Array::from(rstd::move(values)));
+}
+
 auto decode_table(Invocation *invocation, int lua_index, String path,
                   Vec<const void *> &ancestors, usize depth) -> Result<Table> {
   auto *lua = invocation->lua;
@@ -493,8 +592,21 @@ auto decode_value(Invocation *invocation, int lua_index, String path,
     return Ok(Value::String(value.take().unwrap_unchecked()));
   }
   case LUA_TTABLE: {
-    auto value =
-        decode_table(invocation, lua_index, rstd::move(path), ancestors, depth);
+    auto length = dense_array_length(invocation, lua_index);
+    if (length.is_err())
+      return Err(rstd::move(length).unwrap_err_unchecked());
+    if (length->is_some()) {
+      auto value = decode_array(invocation,
+                                lua_index,
+                                rstd::move(path),
+                                ancestors,
+                                depth,
+                                **length);
+      if (value.is_err())
+        return Err(rstd::move(value).unwrap_err_unchecked());
+      return Ok(Value::Array(rstd::move(value).unwrap_unchecked()));
+    }
+    auto value = decode_table(invocation, lua_index, rstd::move(path), ancestors, depth);
     if (value.is_err())
       return Err(rstd::move(value).unwrap_err_unchecked());
     return Ok(Value::Table(rstd::move(value).unwrap_unchecked()));
@@ -517,6 +629,25 @@ auto read_table(void *context, usize index) -> Result<Table> {
                            index + usize(1));
   return decode_table(invocation, lua_index, rstd::move(path), ancestors,
                       usize());
+}
+
+auto read_array(void *context, usize index) -> Result<Array> {
+  auto *invocation = static_cast<Invocation *>(context);
+  auto lua_index = static_cast<int>(index.to_primitive() + 1);
+  if (index >= usize(lua_gettop(invocation->lua)) ||
+      lua_type(invocation->lua, lua_index) != LUA_TTABLE) {
+    return Err(invocation_type_error(invocation, index, "an array"_str));
+  }
+  auto length = dense_array_length(invocation, lua_index);
+  if (length.is_err())
+    return Err(rstd::move(length).unwrap_err_unchecked());
+  if (length->is_none())
+    return Err(invocation_type_error(invocation, index, "a non-empty array"_str));
+  auto ancestors = Vec<const void *>::make();
+  auto path = rstd::format("{} argument {}", invocation->slot->source.as_str(),
+                           index + usize(1));
+  return decode_array(invocation, lua_index, rstd::move(path), ancestors,
+                      usize(), **length);
 }
 
 void stage_value(void *context, Value value) {
@@ -757,7 +888,7 @@ int State::dispatch(void* lua_state) {
         auto invocation = Invocation { lua, slot };
         auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
                                actual, read_i64, read_bool, read_string,
-                               read_table, stage_value);
+                               read_table, read_array, stage_value);
         auto result     = slot->callback->operator()(frame);
         if (result.is_err()) {
             auto error = rstd::move(result).unwrap_err_unchecked();
