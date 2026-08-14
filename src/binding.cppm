@@ -348,6 +348,7 @@ public:
       push_value_(context_, Value::Table(rstd::move(value)));
     }
     void push(Value value) { push_value_(context_, rstd::move(value)); }
+    void push_nil() { push_nil_(context_); }
 
   private:
     using ReadI64    = auto (*)(void*, usize) -> Result<i64>;
@@ -356,14 +357,15 @@ public:
     using ReadTable = auto (*)(void *, usize) -> Result<Table>;
     using ReadArray = auto (*)(void *, usize) -> Result<Array>;
     using PushValue = void (*)(void *, Value);
+    using PushNil = void (*)(void *);
 
     CallFrame(void *context, usize argument_count, ReadI64 read_i64,
               ReadBool read_bool, ReadString read_string, ReadTable read_table,
-              ReadArray read_array,
-              PushValue push_value) noexcept
+              ReadArray read_array, PushValue push_value, PushNil push_nil) noexcept
         : context_(context), argument_count_(argument_count),
           read_i64_(read_i64), read_bool_(read_bool), read_string_(read_string),
-          read_table_(read_table), read_array_(read_array), push_value_(push_value) {}
+          read_table_(read_table), read_array_(read_array), push_value_(push_value),
+          push_nil_(push_nil) {}
 
     void*      context_;
     usize      argument_count_;
@@ -373,6 +375,7 @@ public:
     ReadTable read_table_;
     ReadArray read_array_;
     PushValue push_value_;
+    PushNil push_nil_;
 
     friend class State;
 };

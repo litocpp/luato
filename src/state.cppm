@@ -66,13 +66,13 @@ struct CallbackSlot {
     String              source;
     usize               arity;
     Box<NativeCallback> callback;
-    Vec<Value> returns;
+    Vec<Option<Value>> returns;
     Option<Error>       pending_error;
 
     CallbackSlot(String name, String source, usize arity,
                  Box<NativeCallback> callback)
         : name(rstd::move(name)), source(rstd::move(source)), arity(arity),
-          callback(rstd::move(callback)), returns(Vec<Value>::make()),
+          callback(rstd::move(callback)), returns(Vec<Option<Value>>::make()),
           pending_error(None()) {}
 };
 
@@ -652,7 +652,12 @@ auto read_array(void *context, usize index) -> Result<Array> {
 
 void stage_value(void *context, Value value) {
   auto *invocation = static_cast<Invocation *>(context);
-  invocation->slot->returns.push(rstd::move(value));
+  invocation->slot->returns.push(Some(rstd::move(value)));
+}
+
+void stage_nil(void *context) {
+  auto *invocation = static_cast<Invocation *>(context);
+  invocation->slot->returns.push(None());
 }
 
 int raise_pending_error(lua_State* state, CallbackSlot* slot) {
@@ -674,7 +679,11 @@ int raise_pending_error(lua_State* state, CallbackSlot* slot) {
 
 int push_pending_values(lua_State* state, CallbackSlot* slot, int result_count) {
     for (auto index = usize(); index < slot->returns.len(); ++index) {
-      if (push_value(state, slot->returns[index]))
+      if (slot->returns[index].is_none()) {
+        lua_pushnil(state);
+        continue;
+      }
+      if (push_value(state, *slot->returns[index]))
         continue;
       slot->pending_error = Some(Error{
           ErrorKind::Memory,
@@ -888,7 +897,7 @@ int State::dispatch(void* lua_state) {
         auto invocation = Invocation { lua, slot };
         auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
                                actual, read_i64, read_bool, read_string,
-                               read_table, read_array, stage_value);
+                               read_table, read_array, stage_value, stage_nil);
         auto result     = slot->callback->operator()(frame);
         if (result.is_err()) {
             auto error = rstd::move(result).unwrap_err_unchecked();

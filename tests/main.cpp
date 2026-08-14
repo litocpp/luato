@@ -144,6 +144,13 @@ int main() {
                                                 frame.push(true);
                                                 return Ok(usize(1));
                                             }));
+        host.add(
+            luato::NativeFunctionSpec::make(String::make("nothing"_str),
+                                            usize {},
+                                            [](luato::CallFrame& frame) -> luato::BindingResult {
+                                                frame.push_nil();
+                                                return Ok(usize(1));
+                                            }));
         host.add(luato::NativeFunctionSpec::make(
             String::make("invert"_str), usize(1),
             [](luato::CallFrame &frame) -> luato::BindingResult {
