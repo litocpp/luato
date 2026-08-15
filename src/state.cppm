@@ -153,6 +153,9 @@ auto push_value(lua_State *state, const Value &value) -> bool {
                     text.len().to_primitive());
     return true;
   }
+  case Value::Tag::Opaque:
+    lua_pushlightuserdata(state, const_cast<void *>(value.as_Opaque().value));
+    return true;
   case Value::Tag::Table: {
     const auto &table = value.as_Table().value;
     auto count = rstd::try_from<int>(table->entries().len());
@@ -591,6 +594,8 @@ auto decode_value(Invocation *invocation, int lua_index, String path,
     }
     return Ok(Value::String(value.take().unwrap_unchecked()));
   }
+  case LUA_TLIGHTUSERDATA:
+    return Ok(Value::Opaque(lua_touserdata(lua, lua_index)));
   case LUA_TTABLE: {
     auto length = dense_array_length(invocation, lua_index);
     if (length.is_err())
@@ -616,6 +621,16 @@ auto decode_value(Invocation *invocation, int lua_index, String path,
                                 "an integer, boolean, string, or table"_str,
                                 lua_index));
   }
+}
+
+auto read_opaque(void *context, usize index) -> Result<OpaqueHandle> {
+  auto *invocation = static_cast<Invocation *>(context);
+  auto lua_index = static_cast<int>(index.to_primitive() + 1);
+  if (index >= usize(lua_gettop(invocation->lua)) ||
+      lua_type(invocation->lua, lua_index) != LUA_TLIGHTUSERDATA) {
+    return Err(invocation_type_error(invocation, index, "an opaque handle"_str));
+  }
+  return Ok(OpaqueHandle { .identity = lua_touserdata(invocation->lua, lua_index) });
 }
 
 auto read_table(void *context, usize index) -> Result<Table> {
@@ -897,7 +912,7 @@ int State::dispatch(void* lua_state) {
         auto invocation = Invocation { lua, slot };
         auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
                                actual, read_i64, read_bool, read_string,
-                               read_table, read_array, stage_value, stage_nil);
+                               read_table, read_array, read_opaque, stage_value, stage_nil);
         auto result     = slot->callback->operator()(frame);
         if (result.is_err()) {
             auto error = rstd::move(result).unwrap_err_unchecked();

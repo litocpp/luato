@@ -15,11 +15,16 @@ class State;
 class Table;
 class Array;
 
+struct OpaqueHandle {
+  const void *identity {};
+};
+
 class Value {
   RSTD_ENUM(Value,
             (Integer, (i64 value;)),
             (Boolean, (bool value;)),
             (String, (::alloc::string::String value;)),
+            (Opaque, (const void *value;)),
             (Table, (Box<luato::Table> value;)),
             (Array, (Box<luato::Array> value;)))
 
@@ -112,6 +117,9 @@ public:
   auto set(String key, String value) -> Result<empty> {
     return insert(rstd::move(key), Value::String(rstd::move(value)));
   }
+  auto set(String key, OpaqueHandle value) -> Result<empty> {
+    return insert(rstd::move(key), Value::Opaque(value.identity));
+  }
   auto set(String key, Table value) -> Result<empty> {
     return insert(rstd::move(key), Value::Table(rstd::move(value)));
   }
@@ -122,7 +130,7 @@ public:
   template <typename T>
     requires(rstd::mtp::same_as<T, i64> || rstd::mtp::same_as<T, bool> ||
              rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table> ||
-             rstd::mtp::same_as<T, Array>)
+             rstd::mtp::same_as<T, Array> || rstd::mtp::same_as<T, OpaqueHandle>)
   auto required(ref<str> key) const -> Result<T> {
     auto *value = lookup(key);
     if (value == nullptr) {
@@ -147,10 +155,14 @@ public:
       if (value->is_Table())
         return Ok(value->as_Table().value->clone());
       return Err(field_type_error(key, "a table"_str, *value));
-    } else {
+    } else if constexpr (rstd::mtp::same_as<T, Array>) {
       if (value->is_Array())
         return Ok(value->as_Array().value->clone());
       return Err(field_type_error(key, "an array"_str, *value));
+    } else {
+      if (value->is_Opaque())
+        return Ok(OpaqueHandle { .identity = value->as_Opaque().value });
+      return Err(field_type_error(key, "an opaque handle"_str, *value));
     }
   }
 
@@ -193,6 +205,8 @@ inline auto Value::type_name() const noexcept -> ref<str> {
     return "boolean"_str;
   case Tag::String:
     return "string"_str;
+  case Tag::Opaque:
+    return "opaque handle"_str;
   case Tag::Table:
     return "table"_str;
   case Tag::Array:
@@ -209,6 +223,8 @@ inline auto Value::clone() const -> Value {
     return Boolean(as_Boolean().value);
   case Tag::String:
     return String(as_String().value.clone());
+  case Tag::Opaque:
+    return Opaque(as_Opaque().value);
   case Tag::Table:
     return Table(Box<luato::Table>::make(as_Table().value->clone()));
   case Tag::Array:
@@ -298,6 +314,10 @@ inline auto Table::scalar_entries() const -> Result<Vec<ScalarEntry>> {
           entry.key.clone(), rstd::move(path),
           ScalarValue::String(entry.value.as_String().value.clone())});
       break;
+    case Value::Tag::Opaque:
+      return Err(Error::make(
+          ErrorKind::Type, String::make(),
+          rstd::format("{} must be a scalar, received opaque handle", path.as_str())));
     case Value::Tag::Table:
       return Err(Error::make(
           ErrorKind::Type, String::make(),
@@ -321,7 +341,7 @@ public:
     template <typename T>
       requires(rstd::mtp::same_as<T, i64> || rstd::mtp::same_as<T, bool> ||
                rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table> ||
-               rstd::mtp::same_as<T, Array>)
+               rstd::mtp::same_as<T, Array> || rstd::mtp::same_as<T, OpaqueHandle>)
     auto required(usize index) -> Result<T> {
       if constexpr (rstd::mtp::same_as<T, i64>) {
         return read_i64_(context_, index);
@@ -331,8 +351,10 @@ public:
         return read_string_(context_, index);
       } else if constexpr (rstd::mtp::same_as<T, Table>) {
         return read_table_(context_, index);
-      } else {
+      } else if constexpr (rstd::mtp::same_as<T, Array>) {
         return read_array_(context_, index);
+      } else {
+        return read_opaque_(context_, index);
       }
     }
 
@@ -347,6 +369,9 @@ public:
     void push(Table value) {
       push_value_(context_, Value::Table(rstd::move(value)));
     }
+    void push(OpaqueHandle value) {
+      push_value_(context_, Value::Opaque(value.identity));
+    }
     void push(Value value) { push_value_(context_, rstd::move(value)); }
     void push_nil() { push_nil_(context_); }
 
@@ -356,16 +381,18 @@ public:
     using ReadString = auto (*)(void*, usize) -> Result<String>;
     using ReadTable = auto (*)(void *, usize) -> Result<Table>;
     using ReadArray = auto (*)(void *, usize) -> Result<Array>;
+    using ReadOpaque = auto (*)(void *, usize) -> Result<OpaqueHandle>;
     using PushValue = void (*)(void *, Value);
     using PushNil = void (*)(void *);
 
     CallFrame(void *context, usize argument_count, ReadI64 read_i64,
               ReadBool read_bool, ReadString read_string, ReadTable read_table,
-              ReadArray read_array, PushValue push_value, PushNil push_nil) noexcept
+              ReadArray read_array, ReadOpaque read_opaque, PushValue push_value,
+              PushNil push_nil) noexcept
         : context_(context), argument_count_(argument_count),
           read_i64_(read_i64), read_bool_(read_bool), read_string_(read_string),
-          read_table_(read_table), read_array_(read_array), push_value_(push_value),
-          push_nil_(push_nil) {}
+          read_table_(read_table), read_array_(read_array), read_opaque_(read_opaque),
+          push_value_(push_value), push_nil_(push_nil) {}
 
     void*      context_;
     usize      argument_count_;
@@ -374,6 +401,7 @@ public:
     ReadString read_string_;
     ReadTable read_table_;
     ReadArray read_array_;
+    ReadOpaque read_opaque_;
     PushValue push_value_;
     PushNil push_nil_;
 

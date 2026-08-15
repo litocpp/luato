@@ -108,7 +108,39 @@ int main() {
         }
 
         auto host = luato::ModuleSpec(String::make("host"_str));
+        auto opaque_identity = i32(42);
         host.set(String::make("profile"_str), String::make("debug"_str));
+        host.add(luato::NativeFunctionSpec::make(
+            String::make("handle"_str),
+            usize {},
+            [&opaque_identity](luato::CallFrame& frame) -> luato::BindingResult {
+                frame.push(luato::OpaqueHandle {
+                    .identity = static_cast<const void*>(rstd::addressof(opaque_identity)),
+                });
+                return Ok(usize(1));
+            }));
+        host.add(luato::NativeFunctionSpec::make(
+            String::make("consume"_str),
+            usize(1),
+            [&opaque_identity](luato::CallFrame& frame) -> luato::BindingResult {
+                auto handle = frame.required<luato::OpaqueHandle>(usize {});
+                if (handle.is_err()) return Err(rstd::move(handle).unwrap_err_unchecked());
+                frame.push(handle->identity ==
+                           static_cast<const void*>(rstd::addressof(opaque_identity)));
+                return Ok(usize(1));
+            }));
+        host.add(luato::NativeFunctionSpec::make(
+            String::make("consume_table"_str),
+            usize(1),
+            [&opaque_identity](luato::CallFrame& frame) -> luato::BindingResult {
+                auto request = frame.required<luato::Table>(usize {});
+                if (request.is_err()) return Err(rstd::move(request).unwrap_err_unchecked());
+                auto handle = request->required<luato::OpaqueHandle>("tool"_str);
+                if (handle.is_err()) return Err(rstd::move(handle).unwrap_err_unchecked());
+                frame.push(handle->identity ==
+                           static_cast<const void*>(rstd::addressof(opaque_identity)));
+                return Ok(usize(1));
+            }));
         host.add(luato::NativeFunctionSpec::make(
             String::make("add"_str),
             usize(2),
@@ -281,6 +313,9 @@ int main() {
         auto structured_array_result = state.execute_file(structured_array.as_path());
         checks.expect(structured_array_result.is_ok(),
                       "structured array binding fixture should pass");
+
+        auto opaque_handle = state.execute_file(fixture("opaque-handle.lua"_str).as_path());
+        checks.expect(opaque_handle.is_ok(), "opaque handle fixture should pass");
 
         auto missing = fixture("missing.lua"_str);
         expect_script_error(checks,
