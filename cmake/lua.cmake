@@ -55,4 +55,4 @@ target_include_directories(luato.lua INTERFACE ${lua_SOURCE_DIR}/src)
 target_link_directories(luato.lua INTERFACE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(luato.lua INTERFACE -lluato.lua-runtime ${CMAKE_DL_LIBS} m)
 
-set(Lua_VERSION "5.5.0")
+set(Lua_VERSION "5.5.1")
