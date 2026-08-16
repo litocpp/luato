@@ -12,7 +12,6 @@ if(NOT luato_IS_TOP_LEVEL)
             -Wunknown-attributes)
 endif()
 target_compile_definitions(luato.ffi.lua PRIVATE LUA_USE_LINUX)
-target_include_directories(luato.ffi.lua PRIVATE ${lua_SOURCE_DIR}/src)
 target_sources(
   luato.ffi.lua
   PUBLIC FILE_SET
@@ -24,7 +23,7 @@ target_sources(
          types.cppm
          constants.cppm
          functions.cppm)
-target_link_libraries(luato.ffi.lua PUBLIC luato.lua-runtime)
+target_link_libraries(luato.ffi.lua PUBLIC Lua::Lua)
 set_target_properties(
   luato.ffi.lua
   PROPERTIES CXX_EXTENSIONS OFF
