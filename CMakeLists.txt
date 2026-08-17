@@ -15,6 +15,8 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
 endif()
 
 if(PROJECT_IS_TOP_LEVEL)
+  include(GNUInstallDirs)
+
   set(CMAKE_C_STANDARD 99)
   set(CMAKE_C_STANDARD_REQUIRED ON)
   set(CMAKE_C_EXTENSIONS ON)
@@ -32,6 +34,9 @@ if(PROJECT_IS_TOP_LEVEL)
     "$<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-declarations>"
     "$<$<COMPILE_LANGUAGE:CXX>:-Wunknown-attributes>"
     "$<$<COMPILE_LANGUAGE:CXX>:-fsized-deallocation>")
+
+  install(FILES LICENSE-MIT LICENSE-APACHE
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/luato)
 endif()
 
 option(LUATO_BUILD_TESTS "Build standalone Luato contract tests" ${PROJECT_IS_TOP_LEVEL})
