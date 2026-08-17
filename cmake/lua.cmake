@@ -43,16 +43,19 @@ set(LUATO_LUA_SOURCES
 
 add_library(luato.lua-runtime STATIC ${LUATO_LUA_SOURCES})
 target_compile_features(luato.lua-runtime PRIVATE c_std_99)
-target_compile_definitions(luato.lua-runtime PRIVATE LUA_USE_LINUX)
+target_compile_definitions(
+  luato.lua-runtime
+  PRIVATE "$<$<PLATFORM_ID:Linux>:LUA_USE_LINUX>")
 target_include_directories(luato.lua-runtime PRIVATE ${lua_SOURCE_DIR}/src)
-target_link_libraries(luato.lua-runtime PUBLIC ${CMAKE_DL_LIBS} m)
+target_link_libraries(luato.lua-runtime PUBLIC ${CMAKE_DL_LIBS})
+if(NOT WIN32)
+  target_link_libraries(luato.lua-runtime PUBLIC m)
+endif()
 set_target_properties(luato.lua-runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(luato.lua INTERFACE)
 add_library(Lua::Lua ALIAS luato.lua)
-add_dependencies(luato.lua luato.lua-runtime)
 target_include_directories(luato.lua INTERFACE ${lua_SOURCE_DIR}/src)
-target_link_directories(luato.lua INTERFACE ${CMAKE_CURRENT_BINARY_DIR})
-target_link_libraries(luato.lua INTERFACE -lluato.lua-runtime ${CMAKE_DL_LIBS} m)
+target_link_libraries(luato.lua INTERFACE luato.lua-runtime)
 
 set(Lua_VERSION "5.5.1")

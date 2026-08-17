@@ -8,24 +8,20 @@ export import :error;
 using namespace rstd::prelude;
 using namespace rstd::literals;
 
-export namespace luato
-{
+export namespace luato {
 
 class State;
 class Table;
 class Array;
 
 struct OpaqueHandle {
-  const void *identity {};
+  const void *identity{};
 };
 
 class Value {
-  RSTD_ENUM(Value,
-            (Integer, (i64 value;)),
-            (Boolean, (bool value;)),
+  RSTD_ENUM(Value, (Integer, (i64 value;)), (Boolean, (bool value;)),
             (String, (::alloc::string::String value;)),
-            (Opaque, (const void *value;)),
-            (Table, (Box<luato::Table> value;)),
+            (Opaque, (const void *value;)), (Table, (Box<luato::Table> value;)),
             (Array, (Box<luato::Array> value;)))
 
 public:
@@ -70,9 +66,7 @@ struct TableEntry {
 };
 
 class ScalarValue {
-  RSTD_ENUM(ScalarValue,
-            (Integer, (i64 value;)),
-            (Boolean, (bool value;)),
+  RSTD_ENUM(ScalarValue, (Integer, (i64 value;)), (Boolean, (bool value;)),
             (String, (::alloc::string::String value;)))
 
 public:
@@ -130,7 +124,8 @@ public:
   template <typename T>
     requires(rstd::mtp::same_as<T, i64> || rstd::mtp::same_as<T, bool> ||
              rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table> ||
-             rstd::mtp::same_as<T, Array> || rstd::mtp::same_as<T, OpaqueHandle>)
+             rstd::mtp::same_as<T, Array> ||
+             rstd::mtp::same_as<T, OpaqueHandle>)
   auto required(ref<str> key) const -> Result<T> {
     auto *value = lookup(key);
     if (value == nullptr) {
@@ -161,7 +156,7 @@ public:
       return Err(field_type_error(key, "an array"_str, *value));
     } else {
       if (value->is_Opaque())
-        return Ok(OpaqueHandle { .identity = value->as_Opaque().value });
+        return Ok(OpaqueHandle{.identity = value->as_Opaque().value});
       return Err(field_type_error(key, "an opaque handle"_str, *value));
     }
   }
@@ -230,7 +225,7 @@ inline auto Value::clone() const -> Value {
   case Tag::Array:
     return Array(Box<luato::Array>::make(as_Array().value->clone()));
   }
-  rstd::panic { "invalid Luato value tag" };
+  rstd::panic{"invalid Luato value tag"};
 }
 
 inline auto Table::clone() const -> Table {
@@ -317,7 +312,8 @@ inline auto Table::scalar_entries() const -> Result<Vec<ScalarEntry>> {
     case Value::Tag::Opaque:
       return Err(Error::make(
           ErrorKind::Type, String::make(),
-          rstd::format("{} must be a scalar, received opaque handle", path.as_str())));
+          rstd::format("{} must be a scalar, received opaque handle",
+                       path.as_str())));
     case Value::Tag::Table:
       return Err(Error::make(
           ErrorKind::Type, String::make(),
@@ -333,103 +329,108 @@ inline auto Table::scalar_entries() const -> Result<Vec<ScalarEntry>> {
 
 class CallFrame {
 public:
-    CallFrame(const CallFrame&)            = delete;
-    CallFrame& operator=(const CallFrame&) = delete;
+  CallFrame(const CallFrame &) = delete;
+  CallFrame &operator=(const CallFrame &) = delete;
 
-    auto argument_count() const noexcept -> usize { return argument_count_; }
+  auto argument_count() const noexcept -> usize { return argument_count_; }
 
-    template <typename T>
-      requires(rstd::mtp::same_as<T, i64> || rstd::mtp::same_as<T, bool> ||
-               rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table> ||
-               rstd::mtp::same_as<T, Array> || rstd::mtp::same_as<T, OpaqueHandle>)
-    auto required(usize index) -> Result<T> {
-      if constexpr (rstd::mtp::same_as<T, i64>) {
-        return read_i64_(context_, index);
-      } else if constexpr (rstd::mtp::same_as<T, bool>) {
-        return read_bool_(context_, index);
-      } else if constexpr (rstd::mtp::same_as<T, String>) {
-        return read_string_(context_, index);
-      } else if constexpr (rstd::mtp::same_as<T, Table>) {
-        return read_table_(context_, index);
-      } else if constexpr (rstd::mtp::same_as<T, Array>) {
-        return read_array_(context_, index);
-      } else {
-        return read_opaque_(context_, index);
-      }
+  template <typename T>
+    requires(rstd::mtp::same_as<T, i64> || rstd::mtp::same_as<T, bool> ||
+             rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table> ||
+             rstd::mtp::same_as<T, Array> ||
+             rstd::mtp::same_as<T, OpaqueHandle>)
+  auto required(usize index) -> Result<T> {
+    if constexpr (rstd::mtp::same_as<T, i64>) {
+      return read_i64_(context_, index);
+    } else if constexpr (rstd::mtp::same_as<T, bool>) {
+      return read_bool_(context_, index);
+    } else if constexpr (rstd::mtp::same_as<T, String>) {
+      return read_string_(context_, index);
+    } else if constexpr (rstd::mtp::same_as<T, Table>) {
+      return read_table_(context_, index);
+    } else if constexpr (rstd::mtp::same_as<T, Array>) {
+      return read_array_(context_, index);
+    } else {
+      return read_opaque_(context_, index);
     }
+  }
 
-    void push(i64 value) { push_value_(context_, Value::Integer(value)); }
-    void push(bool value) { push_value_(context_, Value::Boolean(value)); }
-    void push(ref<str> value) {
-      push_value_(context_, Value::String(String::make(value)));
-    }
-    void push(String value) {
-      push_value_(context_, Value::String(rstd::move(value)));
-    }
-    void push(Table value) {
-      push_value_(context_, Value::Table(rstd::move(value)));
-    }
-    void push(OpaqueHandle value) {
-      push_value_(context_, Value::Opaque(value.identity));
-    }
-    void push(Value value) { push_value_(context_, rstd::move(value)); }
-    void push_nil() { push_nil_(context_); }
+  void push(i64 value) { push_value_(context_, Value::Integer(value)); }
+  void push(bool value) { push_value_(context_, Value::Boolean(value)); }
+  void push(ref<str> value) {
+    push_value_(context_, Value::String(String::make(value)));
+  }
+  void push(String value) {
+    push_value_(context_, Value::String(rstd::move(value)));
+  }
+  void push(Table value) {
+    push_value_(context_, Value::Table(rstd::move(value)));
+  }
+  void push(OpaqueHandle value) {
+    push_value_(context_, Value::Opaque(value.identity));
+  }
+  void push(Value value) { push_value_(context_, rstd::move(value)); }
+  void push_nil() { push_nil_(context_); }
 
-  private:
-    using ReadI64    = auto (*)(void*, usize) -> Result<i64>;
-    using ReadBool = auto (*)(void *, usize) -> Result<bool>;
-    using ReadString = auto (*)(void*, usize) -> Result<String>;
-    using ReadTable = auto (*)(void *, usize) -> Result<Table>;
-    using ReadArray = auto (*)(void *, usize) -> Result<Array>;
-    using ReadOpaque = auto (*)(void *, usize) -> Result<OpaqueHandle>;
-    using PushValue = void (*)(void *, Value);
-    using PushNil = void (*)(void *);
+private:
+  using ReadI64 = auto (*)(void *, usize) -> Result<i64>;
+  using ReadBool = auto (*)(void *, usize) -> Result<bool>;
+  using ReadString = auto (*)(void *, usize) -> Result<String>;
+  using ReadTable = auto (*)(void *, usize) -> Result<Table>;
+  using ReadArray = auto (*)(void *, usize) -> Result<Array>;
+  using ReadOpaque = auto (*)(void *, usize) -> Result<OpaqueHandle>;
+  using PushValue = void (*)(void *, Value);
+  using PushNil = void (*)(void *);
 
-    CallFrame(void *context, usize argument_count, ReadI64 read_i64,
-              ReadBool read_bool, ReadString read_string, ReadTable read_table,
-              ReadArray read_array, ReadOpaque read_opaque, PushValue push_value,
-              PushNil push_nil) noexcept
-        : context_(context), argument_count_(argument_count),
-          read_i64_(read_i64), read_bool_(read_bool), read_string_(read_string),
-          read_table_(read_table), read_array_(read_array), read_opaque_(read_opaque),
-          push_value_(push_value), push_nil_(push_nil) {}
+  CallFrame(void *context, usize argument_count, ReadI64 read_i64,
+            ReadBool read_bool, ReadString read_string, ReadTable read_table,
+            ReadArray read_array, ReadOpaque read_opaque, PushValue push_value,
+            PushNil push_nil) noexcept
+      : context_(context), argument_count_(argument_count), read_i64_(read_i64),
+        read_bool_(read_bool), read_string_(read_string),
+        read_table_(read_table), read_array_(read_array),
+        read_opaque_(read_opaque), push_value_(push_value),
+        push_nil_(push_nil) {}
 
-    void*      context_;
-    usize      argument_count_;
-    ReadI64    read_i64_;
-    ReadBool read_bool_;
-    ReadString read_string_;
-    ReadTable read_table_;
-    ReadArray read_array_;
-    ReadOpaque read_opaque_;
-    PushValue push_value_;
-    PushNil push_nil_;
+  void *context_;
+  usize argument_count_;
+  ReadI64 read_i64_;
+  ReadBool read_bool_;
+  ReadString read_string_;
+  ReadTable read_table_;
+  ReadArray read_array_;
+  ReadOpaque read_opaque_;
+  PushValue push_value_;
+  PushNil push_nil_;
 
-    friend class State;
+  friend class State;
 };
 
-using NativeCallback = dyn<FnMut<BindingResult(CallFrame&)>>;
+using NativeCallback = dyn<FnMut<BindingResult(CallFrame &)>>;
 
 class NativeFunctionSpec {
 public:
-    NativeFunctionSpec(NativeFunctionSpec&&) noexcept            = default;
-    NativeFunctionSpec& operator=(NativeFunctionSpec&&) noexcept = default;
+  NativeFunctionSpec(NativeFunctionSpec &&) noexcept = default;
+  NativeFunctionSpec &operator=(NativeFunctionSpec &&) noexcept = default;
 
-    template<typename Callback>
-    static auto make(String name, usize arity, Callback&& callback) -> NativeFunctionSpec {
-        return NativeFunctionSpec(
-            rstd::move(name), arity, Box<NativeCallback>::make(rstd::forward<Callback>(callback)));
-    }
+  template <typename Callback>
+  static auto make(String name, usize arity, Callback &&callback)
+      -> NativeFunctionSpec {
+    return NativeFunctionSpec(
+        rstd::move(name), arity,
+        Box<NativeCallback>::make(rstd::forward<Callback>(callback)));
+  }
 
 private:
-    NativeFunctionSpec(String name, usize arity, Box<NativeCallback> callback)
-        : name_(rstd::move(name)), arity_(arity), callback_(rstd::move(callback)) {}
+  NativeFunctionSpec(String name, usize arity, Box<NativeCallback> callback)
+      : name_(rstd::move(name)), arity_(arity),
+        callback_(rstd::move(callback)) {}
 
-    String              name_;
-    usize               arity_;
-    Box<NativeCallback> callback_;
+  String name_;
+  usize arity_;
+  Box<NativeCallback> callback_;
 
-    friend class State;
+  friend class State;
 };
 
 class ModuleSpec {
@@ -462,11 +463,11 @@ public:
   }
 
 private:
-    String                  name_;
-    Vec<NativeFunctionSpec> functions_;
-    Vec<TableEntry> fields_;
+  String name_;
+  Vec<NativeFunctionSpec> functions_;
+  Vec<TableEntry> fields_;
 
-    friend class State;
+  friend class State;
 };
 
 } // namespace luato

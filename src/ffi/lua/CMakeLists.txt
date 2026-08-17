@@ -11,7 +11,9 @@ if(NOT luato_IS_TOP_LEVEL)
             -Wno-deprecated-declarations
             -Wunknown-attributes)
 endif()
-target_compile_definitions(luato.ffi.lua PRIVATE LUA_USE_LINUX)
+target_compile_definitions(
+  luato.ffi.lua
+  PRIVATE "$<$<PLATFORM_ID:Linux>:LUA_USE_LINUX>")
 target_sources(
   luato.ffi.lua
   PUBLIC FILE_SET

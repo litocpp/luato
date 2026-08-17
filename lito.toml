@@ -13,7 +13,6 @@ sources = ["tests/main.cpp"]
 
 [usage]
 private-definitions = [
-  "LUA_USE_LINUX",
   "LUATO_FIXTURE_DIR=\"tests/fixtures\"",
 ]
 

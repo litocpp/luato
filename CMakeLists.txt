@@ -10,8 +10,8 @@ if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   message(FATAL_ERROR "luato currently supports Clang only")
 endif()
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  message(FATAL_ERROR "luato currently supports Linux only")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
+  message(FATAL_ERROR "luato currently supports Linux and Windows only")
 endif()
 
 if(PROJECT_IS_TOP_LEVEL)
