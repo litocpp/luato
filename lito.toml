@@ -16,6 +16,12 @@ private-definitions = [
   "LUATO_FIXTURE_DIR=\"tests/fixtures\"",
 ]
 
+[[when]]
+condition = 'target.os == "linux"'
+
+[when.usage]
+private-definitions = ["LUA_USE_LINUX"]
+
 [profile]
 exceptions = false
 rtti = false
