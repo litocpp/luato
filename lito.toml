@@ -32,9 +32,8 @@ git = "https://github.com/litocpp/rstd.git"
 visibility = "public"
 
 [external-dependencies.cmake.lua]
-find-package = "Lua"
+package = "Lua"
 archive = "https://www.lua.org/ftp/lua-5.5.1.tar.gz"
 sha256 = "1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce"
-integration = "build-tree"
 adapter = "cmake/lua.cmake"
 targets = [{ name = "Lua::Lua", visibility = "public" }]
