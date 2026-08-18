@@ -1,5 +1,3 @@
-include(${luato_SOURCE_DIR}/cmake/lua.cmake)
-
 add_subdirectory(ffi/lua)
 
 add_library(luato.lib STATIC)

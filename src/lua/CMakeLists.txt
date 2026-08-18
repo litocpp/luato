@@ -2,12 +2,8 @@ if(TARGET Lua::Lua)
   return()
 endif()
 
-if(NOT DEFINED LITO_CMAKE_DEPENDENCY_MODE)
-  message(FATAL_ERROR "luato: LITO_CMAKE_DEPENDENCY_MODE is unset")
-endif()
-
-if(LITO_CMAKE_DEPENDENCY_MODE STREQUAL "find")
-  find_package(Lua REQUIRED)
+find_package(Lua 5.5.1 QUIET)
+if(Lua_FOUND)
   if(NOT TARGET Lua::Lua)
     add_library(luato.lua INTERFACE)
     add_library(Lua::Lua ALIAS luato.lua)
@@ -17,21 +13,15 @@ if(LITO_CMAKE_DEPENDENCY_MODE STREQUAL "find")
   return()
 endif()
 
-if(NOT LITO_CMAKE_DEPENDENCY_MODE STREQUAL "source")
-  message(FATAL_ERROR
-          "luato: unsupported CMake dependency mode '${LITO_CMAKE_DEPENDENCY_MODE}'")
-endif()
+include(FetchContent)
+FetchContent_Declare(
+  lua
+  URL https://www.lua.org/ftp/lua-5.5.1.tar.gz
+  URL_HASH SHA256=1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(lua)
 
-if(NOT DEFINED LITO_CMAKE_DEPENDENCY_SOURCE_DIR)
-  message(FATAL_ERROR "luato: LITO_CMAKE_DEPENDENCY_SOURCE_DIR is unset")
-endif()
-
-get_property(luato_enabled_languages GLOBAL PROPERTY ENABLED_LANGUAGES)
-if(NOT "C" IN_LIST luato_enabled_languages)
-  enable_language(C)
-endif()
-
-set(LUATO_LUA_SOURCE_DIR "${LITO_CMAKE_DEPENDENCY_SOURCE_DIR}/src")
+set(LUATO_LUA_SOURCE_DIR "${lua_SOURCE_DIR}/src")
 set(LUATO_LUA_SOURCES
     ${LUATO_LUA_SOURCE_DIR}/lapi.c
     ${LUATO_LUA_SOURCE_DIR}/lcode.c
@@ -82,5 +72,3 @@ add_library(luato.lua INTERFACE)
 add_library(Lua::Lua ALIAS luato.lua)
 target_include_directories(luato.lua INTERFACE ${LUATO_LUA_SOURCE_DIR})
 target_link_libraries(luato.lua INTERFACE luato.lua-runtime)
-
-set(Lua_VERSION "5.5.1")

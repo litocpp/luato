@@ -1,0 +1,63 @@
+[package]
+name = "luato-lua"
+version = "5.5.1"
+language = "c"
+minimum-standard = "c99"
+
+[external-sources.lua]
+archive = "https://www.lua.org/ftp/lua-5.5.1.tar.gz"
+sha256 = "1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce"
+
+[source-groups.lua-runtime]
+external-source = "lua"
+sources = [
+  "src/lapi.c",
+  "src/lcode.c",
+  "src/lctype.c",
+  "src/ldebug.c",
+  "src/ldo.c",
+  "src/ldump.c",
+  "src/lfunc.c",
+  "src/lgc.c",
+  "src/llex.c",
+  "src/lmem.c",
+  "src/lobject.c",
+  "src/lopcodes.c",
+  "src/lparser.c",
+  "src/lstate.c",
+  "src/lstring.c",
+  "src/ltable.c",
+  "src/ltm.c",
+  "src/lundump.c",
+  "src/lvm.c",
+  "src/lzio.c",
+  "src/lauxlib.c",
+  "src/lbaselib.c",
+  "src/lcorolib.c",
+  "src/ldblib.c",
+  "src/liolib.c",
+  "src/lmathlib.c",
+  "src/loadlib.c",
+  "src/loslib.c",
+  "src/lstrlib.c",
+  "src/ltablib.c",
+  "src/lutf8lib.c",
+  "src/linit.c",
+]
+
+[lib]
+name = "lua"
+archive = "lua"
+source-groups = ["lua-runtime"]
+
+[usage]
+public-include-directories = [
+  { external-source = "lua", path = "src" },
+]
+
+[[when]]
+condition = 'target.os == "linux"'
+
+[when.usage]
+private-definitions = ["LUA_USE_LINUX"]
+system-libraries = ["dl", "m"]

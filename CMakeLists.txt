@@ -43,26 +43,6 @@ option(LUATO_BUILD_TESTS "Build standalone Luato contract tests" ${PROJECT_IS_TO
 
 include(FetchContent)
 
-if(NOT TARGET Lua::Lua)
-  find_package(Lua 5.5.0)
-  if(Lua_FOUND)
-    if(NOT TARGET Lua::Lua)
-      add_library(Lua::Lua INTERFACE IMPORTED)
-      set_target_properties(
-        Lua::Lua
-        PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${LUA_INCLUDE_DIR}"
-                   INTERFACE_LINK_LIBRARIES "${LUA_LIBRARIES}")
-    endif()
-  else()
-    FetchContent_Declare(
-      lua
-      URL https://www.lua.org/ftp/lua-5.5.1.tar.gz
-      URL_HASH SHA256=1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce
-      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-    FetchContent_MakeAvailable(lua)
-  endif()
-endif()
-
 if(NOT TARGET rstd::rstd)
   set(RSTD_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
   FetchContent_Declare(
@@ -72,6 +52,7 @@ if(NOT TARGET rstd::rstd)
   FetchContent_MakeAvailable(rstd)
 endif()
 
+add_subdirectory(src/lua)
 add_subdirectory(src)
 
 if(LUATO_BUILD_TESTS)
