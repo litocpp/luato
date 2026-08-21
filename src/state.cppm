@@ -1,6 +1,7 @@
 export module luato:state;
 
 export import :binding;
+export import :module_loader;
 
 import :ffi.lua;
 
@@ -11,25 +12,42 @@ export namespace luato {
 
 enum class StandardLibrary {
   Base,
+  String,
+  Table,
 };
 
 struct StateOptions {
   static constexpr auto none() noexcept -> StateOptions {
-    return StateOptions(false);
+    return StateOptions(false, false, false);
   }
   static constexpr auto base() noexcept -> StateOptions {
-    return StateOptions(true);
+    return StateOptions(true, false, false);
+  }
+  static constexpr auto build_script() noexcept -> StateOptions {
+    return StateOptions(true, true, true);
   }
 
   constexpr auto contains(StandardLibrary library) const noexcept -> bool {
-    return library == StandardLibrary::Base && open_base_;
+    switch (library) {
+    case StandardLibrary::Base:
+      return open_base_;
+    case StandardLibrary::String:
+      return open_string_;
+    case StandardLibrary::Table:
+      return open_table_;
+    }
+    return false;
   }
 
 private:
-  constexpr explicit StateOptions(bool open_base) noexcept
-      : open_base_(open_base) {}
+  constexpr explicit StateOptions(bool open_base, bool open_string,
+                                  bool open_table) noexcept
+      : open_base_(open_base), open_string_(open_string),
+        open_table_(open_table) {}
 
   bool open_base_;
+  bool open_string_;
+  bool open_table_;
 };
 
 struct ExecutionReport {
@@ -49,7 +67,10 @@ public:
   static auto create(StateOptions options) -> Result<State>;
 
   auto register_module(ModuleSpec module) -> Result<empty>;
+  auto set_module_resolver(ModuleResolverSpec resolver) -> Result<empty>;
+  auto execute_entry(LuaModuleSource source) -> Result<ExecutionReport>;
   auto execute_file(ref<rstd::path::Path> path) -> Result<ExecutionReport>;
+  auto loaded_modules() const noexcept -> slice<LoadedModule>;
 
 private:
   explicit State(void *storage) noexcept : storage_(storage) {}
@@ -78,14 +99,27 @@ struct CallbackSlot {
         pending_error(None()) {}
 };
 
+struct ModuleFrame {
+  String logical_name;
+  String identity;
+  String display_path;
+};
+
 struct StateStorage {
   lua_State *lua;
   Vec<Box<CallbackSlot>> callbacks;
   Vec<String> modules;
+  Option<Box<ModuleResolver>> module_resolver;
+  Vec<ModuleFrame> module_stack;
+  Vec<LoadedModule> loaded_modules;
+  Option<Error> pending_module_error;
 
   explicit StateStorage(lua_State *state)
       : lua(state), callbacks(Vec<Box<CallbackSlot>>::make()),
-        modules(Vec<String>::make()) {}
+        modules(Vec<String>::make()), module_resolver(None()),
+        module_stack(Vec<ModuleFrame>::make()),
+        loaded_modules(Vec<LoadedModule>::make()),
+        pending_module_error(None()) {}
 
   ~StateStorage() {
     if (lua != nullptr)
@@ -115,6 +149,9 @@ constexpr int ERROR_MESSAGE = 4;
 constexpr int ERROR_TRACEBACK = 5;
 
 char error_marker;
+char module_cache_marker;
+
+int raise_error(lua_State *state, const Error &error);
 
 auto copied_utf8(char const *bytes, size_t length) -> Option<String> {
   auto value = Vec<u8>::with_capacity(usize(length));
@@ -219,6 +256,8 @@ auto error_kind_from_integer(lua_Integer value, ErrorKind fallback) noexcept
     return ErrorKind::Binding;
   case static_cast<lua_Integer>(ErrorKind::Type):
     return ErrorKind::Type;
+  case static_cast<lua_Integer>(ErrorKind::Module):
+    return ErrorKind::Module;
   case static_cast<lua_Integer>(ErrorKind::PanicInvariant):
     return ErrorKind::PanicInvariant;
   default:
@@ -305,9 +344,228 @@ int traceback_handler(lua_State *state) {
   return 1;
 }
 
+auto module_stack_chain(const StateStorage &storage, ref<str> requested)
+    -> String {
+  auto chain = String::make();
+  for (auto index = usize(); index < storage.module_stack.len(); ++index) {
+    if (!chain.is_empty())
+      chain.push_str(" -> "_str);
+    chain.push_str(storage.module_stack[index].logical_name.as_str());
+  }
+  if (!chain.is_empty())
+    chain.push_str(" -> "_str);
+  chain.push_str(requested);
+  return chain;
+}
+
+auto module_error(StateStorage &storage, Error error, ref<str> requested)
+    -> Error {
+  if (error.source.is_empty()) {
+    if (!storage.module_stack.is_empty()) {
+      error.source = storage.module_stack[storage.module_stack.len() - usize(1)]
+                         .display_path.clone();
+    } else {
+      error.source = String::make(requested);
+    }
+  }
+  auto chain = module_stack_chain(storage, requested);
+  error.message = rstd::format("{}\nmodule import chain: {}",
+                               error.message.as_str(), chain.as_str());
+  return error;
+}
+
+auto module_source_error(StateStorage &storage, ref<str> requested,
+                         ref<str> message) -> Error {
+  return module_error(
+      storage,
+      Error::make(ErrorKind::Module, String::make(), String::make(message)),
+      requested);
+}
+
+auto module_cache_get(lua_State *state, ref<str> identity) -> bool {
+  lua_rawgetp(state, LUA_REGISTRYINDEX,
+              static_cast<void *>(&module_cache_marker));
+  auto cache = lua_gettop(state);
+  auto key = String::make(identity);
+  push_string(state, key);
+  lua_rawget(state, cache);
+  if (lua_isnil(state, -1)) {
+    lua_pop(state, 2);
+    return false;
+  }
+  lua_remove(state, cache);
+  return true;
+}
+
+void module_cache_set(lua_State *state, ref<str> identity, int value) {
+  value = lua_absindex(state, value);
+  lua_rawgetp(state, LUA_REGISTRYINDEX,
+              static_cast<void *>(&module_cache_marker));
+  auto cache = lua_gettop(state);
+  auto key = String::make(identity);
+  push_string(state, key);
+  lua_pushvalue(state, value);
+  lua_rawset(state, cache);
+  lua_pop(state, 1);
+}
+
+auto module_chunk_name(ref<str> display_path) -> Result<rstd::ffi::CString> {
+  auto name = String::make("@"_str);
+  name.push_str(display_path);
+  auto converted = rstd::ffi::CString::make(rstd::move(name));
+  if (converted.is_err()) {
+    return Err(Error::make(
+        ErrorKind::Module, String::make(display_path),
+        String::make("Lua module display path contains an interior nul"_str)));
+  }
+  return Ok(rstd::move(converted).unwrap_unchecked());
+}
+
+auto load_module(StateStorage &storage, lua_State *state, ref<str> requested)
+    -> Result<int> {
+  if (storage.module_resolver.is_none()) {
+    return Err(module_source_error(
+        storage, requested,
+        "Lua module resolver is not configured for this state"_str));
+  }
+
+  auto importer_identity = String::make();
+  auto importer_path = String::make();
+  if (!storage.module_stack.is_empty()) {
+    const auto &importer =
+        storage.module_stack[storage.module_stack.len() - usize(1)];
+    importer_identity = importer.identity.clone();
+    importer_path = importer.display_path.clone();
+  }
+
+  auto resolved = (*storage.module_resolver)
+                      ->operator()(ModuleRequest{rstd::move(importer_identity),
+                                                 rstd::move(importer_path),
+                                                 String::make(requested)});
+  if (resolved.is_err()) {
+    return Err(module_error(
+        storage, rstd::move(resolved).unwrap_err_unchecked(), requested));
+  }
+  auto source = rstd::move(resolved).unwrap_unchecked();
+  if (source.logical_name.is_empty()) {
+    return Err(module_source_error(
+        storage, requested, "resolved Lua module has no logical name"_str));
+  }
+  if (source.identity.is_empty()) {
+    return Err(module_source_error(storage, requested,
+                                   "resolved Lua module has no identity"_str));
+  }
+  if (source.display_path.is_empty()) {
+    return Err(module_source_error(
+        storage, requested, "resolved Lua module has no display path"_str));
+  }
+
+  for (const auto &frame : storage.module_stack) {
+    if (frame.identity != source.identity.as_str())
+      continue;
+    return Err(module_source_error(storage, source.logical_name.as_str(),
+                                   "Lua module import cycle detected"_str));
+  }
+
+  if (module_cache_get(state, source.identity.as_str()))
+    return Ok(1);
+
+  auto chunk_name = module_chunk_name(source.display_path.as_str());
+  if (chunk_name.is_err())
+    return Err(rstd::move(chunk_name).unwrap_err_unchecked());
+
+  storage.module_stack.push(ModuleFrame{source.logical_name.clone(),
+                                        source.identity.clone(),
+                                        source.display_path.clone()});
+  auto bytes = source.bytes.as_slice();
+  auto *data = bytes.is_empty()
+                   ? ""
+                   : reinterpret_cast<const char *>(bytes.as_raw_ptr());
+  auto name = rstd::move(chunk_name).unwrap_unchecked();
+  auto status = luaL_loadbufferx(state, data, bytes.len().to_primitive(),
+                                 name.as_ptr(), nullptr);
+  if (status != LUA_OK) {
+    auto kind = status == LUA_ERRSYNTAX ? ErrorKind::Syntax
+                : status == LUA_ERRMEM  ? ErrorKind::Memory
+                                        : ErrorKind::Module;
+    auto error =
+        Error::make(kind, source.display_path.clone(),
+                    copied_lua_string(state, -1, "Lua module load failed"_str));
+    lua_pop(state, 1);
+    (void)storage.module_stack.pop();
+    return Err(
+        module_error(storage, rstd::move(error), source.logical_name.as_str()));
+  }
+
+  lua_pushcfunction(state, traceback_handler);
+  lua_insert(state, -2);
+  auto message_handler = lua_gettop(state) - 1;
+  status = lua_pcall(state, 0, 1, message_handler);
+  if (status != LUA_OK) {
+    auto default_kind =
+        status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime;
+    auto error =
+        error_from_top(state, default_kind, source.display_path.clone());
+    lua_pop(state, 2);
+    (void)storage.module_stack.pop();
+    return Err(
+        module_error(storage, rstd::move(error), source.logical_name.as_str()));
+  }
+  lua_remove(state, message_handler);
+  (void)storage.module_stack.pop();
+
+  if (lua_isnil(state, -1)) {
+    lua_pop(state, 1);
+    lua_pushboolean(state, true);
+  }
+  module_cache_set(state, source.identity.as_str(), -1);
+  storage.loaded_modules.push(LoadedModule{rstd::move(source.logical_name),
+                                           rstd::move(source.identity),
+                                           rstd::move(source.display_path)});
+  return Ok(1);
+}
+
+int require_module(lua_State *state) {
+  auto *storage = *static_cast<StateStorage **>(lua_getextraspace(state));
+  storage->pending_module_error = None();
+  auto result_count = -1;
+  {
+    if (lua_gettop(state) != 1 || lua_type(state, 1) != LUA_TSTRING) {
+      storage->pending_module_error = Some(Error::make(
+          ErrorKind::Type, String::make("require"_str),
+          String::make("require expects one UTF-8 string argument"_str)));
+    } else {
+      auto requested =
+          copied_utf8(lua_tolstring(state, 1, nullptr), lua_rawlen(state, 1));
+      if (requested.is_none()) {
+        storage->pending_module_error = Some(Error::make(
+            ErrorKind::Type, String::make("require"_str),
+            String::make("require module name must be valid UTF-8"_str)));
+      } else {
+        auto name = requested.take().unwrap_unchecked();
+        auto loaded = load_module(*storage, state, name.as_str());
+        if (loaded.is_err()) {
+          storage->pending_module_error =
+              Some(rstd::move(loaded).unwrap_err_unchecked());
+        } else {
+          result_count = rstd::move(loaded).unwrap_unchecked();
+        }
+      }
+    }
+  }
+  if (storage->pending_module_error.is_some())
+    return raise_error(state, *storage->pending_module_error);
+  return result_count;
+}
+
 int bootstrap_state(lua_State *state) {
-  auto libraries = lua_toboolean(state, 1) ? LUA_GLIBK : 0;
+  auto libraries = static_cast<int>(lua_tointeger(state, 1));
   luaL_openselectedlibs(state, libraries, 0);
+  lua_createtable(state, 0, 0);
+  lua_rawsetp(state, LUA_REGISTRYINDEX,
+              static_cast<void *>(&module_cache_marker));
+  lua_pushcfunction(state, require_module);
+  lua_setglobal(state, "require");
   return 0;
 }
 
@@ -705,21 +963,24 @@ void stage_nil(void *context) {
   invocation->slot->returns.push(None());
 }
 
-int raise_pending_error(lua_State *state, CallbackSlot *slot) {
-  auto *error = rstd::addressof(*slot->pending_error);
+int raise_error(lua_State *state, const Error &error) {
   lua_createtable(state, 5, 0);
   auto object = lua_gettop(state);
   lua_pushlightuserdata(state, static_cast<void *>(&error_marker));
   lua_rawseti(state, object, ERROR_TAG);
-  lua_pushinteger(state, static_cast<lua_Integer>(error->kind));
+  lua_pushinteger(state, static_cast<lua_Integer>(error.kind));
   lua_rawseti(state, object, ERROR_KIND);
-  push_string(state, error->source);
+  push_string(state, error.source);
   lua_rawseti(state, object, ERROR_SOURCE);
-  push_string(state, error->message);
+  push_string(state, error.message);
   lua_rawseti(state, object, ERROR_MESSAGE);
-  push_string(state, error->traceback);
+  push_string(state, error.traceback);
   lua_rawseti(state, object, ERROR_TRACEBACK);
   return lua_error(state);
+}
+
+int raise_pending_error(lua_State *state, CallbackSlot *slot) {
+  return raise_error(state, *slot->pending_error);
 }
 
 int push_pending_values(lua_State *state, CallbackSlot *slot,
@@ -797,7 +1058,14 @@ auto State::create(StateOptions options) -> Result<State> {
                     String::make("Lua bootstrap stack allocation failed"_str)));
   }
   lua_pushcfunction(lua, bootstrap_state);
-  lua_pushboolean(lua, options.contains(StandardLibrary::Base));
+  auto libraries = 0;
+  if (options.contains(StandardLibrary::Base))
+    libraries |= LUA_GLIBK;
+  if (options.contains(StandardLibrary::String))
+    libraries |= LUA_STRLIBK;
+  if (options.contains(StandardLibrary::Table))
+    libraries |= LUA_TABLIBK;
+  lua_pushinteger(lua, static_cast<lua_Integer>(libraries));
   auto status = lua_pcall(lua, 1, 0, 0);
   if (status != LUA_OK) {
     auto kind = status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Bootstrap;
@@ -917,6 +1185,26 @@ auto State::register_module(ModuleSpec module) -> Result<empty> {
   return Ok(empty{});
 }
 
+auto State::set_module_resolver(ModuleResolverSpec resolver) -> Result<empty> {
+  if (storage_ == nullptr)
+    return Err(moved_state_error());
+  auto *storage = static_cast<StateStorage *>(storage_);
+  if (storage->module_resolver.is_some()) {
+    return Err(Error::make(
+        ErrorKind::Module, String::make(),
+        String::make("Lua module resolver is already configured"_str)));
+  }
+  storage->module_resolver = Some(rstd::move(resolver.resolver_));
+  return Ok(empty{});
+}
+
+auto State::loaded_modules() const noexcept -> slice<LoadedModule> {
+  if (storage_ == nullptr)
+    return {};
+  auto *storage = static_cast<const StateStorage *>(storage_);
+  return storage->loaded_modules.as_slice();
+}
+
 int State::dispatch(void *lua_state) {
   auto *lua = static_cast<lua_State *>(lua_state);
   auto *slot =
@@ -997,6 +1285,79 @@ int State::dispatch(void *lua_state) {
   return push_pending_values(lua, slot, count);
 }
 
+auto State::execute_entry(LuaModuleSource source) -> Result<ExecutionReport> {
+  if (storage_ == nullptr)
+    return Err(moved_state_error());
+  auto *storage = static_cast<StateStorage *>(storage_);
+  auto *lua = storage->lua;
+  auto old_top = lua_gettop(lua);
+  if (source.logical_name.is_empty()) {
+    return Err(Error::make(ErrorKind::Module, String::make(),
+                           String::make("Lua entry has no logical name"_str)));
+  }
+  if (source.identity.is_empty()) {
+    return Err(Error::make(ErrorKind::Module, source.logical_name.clone(),
+                           String::make("Lua entry has no identity"_str)));
+  }
+  if (source.display_path.is_empty()) {
+    return Err(Error::make(ErrorKind::Module, source.logical_name.clone(),
+                           String::make("Lua entry has no display path"_str)));
+  }
+
+  auto chunk_name = module_chunk_name(source.display_path.as_str());
+  if (chunk_name.is_err())
+    return Err(rstd::move(chunk_name).unwrap_err_unchecked());
+  auto display_path = source.display_path.clone();
+  auto started = rstd::time::Instant::now();
+  storage->module_stack.push(ModuleFrame{source.logical_name.clone(),
+                                         source.identity.clone(),
+                                         source.display_path.clone()});
+  auto bytes = source.bytes.as_slice();
+  auto *data = bytes.is_empty()
+                   ? ""
+                   : reinterpret_cast<const char *>(bytes.as_raw_ptr());
+  auto name = rstd::move(chunk_name).unwrap_unchecked();
+  auto status = luaL_loadbufferx(lua, data, bytes.len().to_primitive(),
+                                 name.as_ptr(), nullptr);
+  if (status != LUA_OK) {
+    auto kind = status == LUA_ERRSYNTAX ? ErrorKind::Syntax
+                : status == LUA_ERRMEM  ? ErrorKind::Memory
+                                        : ErrorKind::Runtime;
+    auto error =
+        Error::make(kind, display_path.clone(),
+                    copied_lua_string(lua, -1, "Lua entry load failed"_str));
+    lua_settop(lua, old_top);
+    (void)storage->module_stack.pop();
+    return Err(rstd::move(error));
+  }
+
+  if (!lua_checkstack(lua, 1)) {
+    lua_settop(lua, old_top);
+    (void)storage->module_stack.pop();
+    return Err(Error::make(
+        ErrorKind::Memory, display_path.clone(),
+        String::make("Lua entry execution stack allocation failed"_str)));
+  }
+  lua_pushcfunction(lua, traceback_handler);
+  lua_insert(lua, old_top + 1);
+  auto message_handler = old_top + 1;
+  status = lua_pcall(lua, 0, LUA_MULTRET, message_handler);
+  (void)storage->module_stack.pop();
+  if (status != LUA_OK) {
+    auto default_kind =
+        status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime;
+    auto error = error_from_top(lua, default_kind, display_path.clone());
+    clear_callback_transients(storage);
+    lua_settop(lua, old_top);
+    return Err(rstd::move(error));
+  }
+
+  clear_callback_transients(storage);
+  lua_settop(lua, old_top);
+  return Ok(ExecutionReport{rstd::path::PathBuf::from(display_path.as_str()),
+                            started.elapsed()});
+}
+
 auto State::execute_file(ref<rstd::path::Path> path)
     -> Result<ExecutionReport> {
   if (storage_ == nullptr)
@@ -1036,7 +1397,11 @@ auto State::execute_file(ref<rstd::path::Path> path)
   lua_pushcfunction(lua, traceback_handler);
   lua_insert(lua, old_top + 1);
   auto message_handler = old_top + 1;
+  storage->module_stack.push(
+      ModuleFrame{String::make("entry"_str),
+                  rstd::format("file:{}", source.as_str()), source.clone()});
   status = lua_pcall(lua, 0, LUA_MULTRET, message_handler);
+  (void)storage->module_stack.pop();
   if (status != LUA_OK) {
     auto default_kind =
         status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime;

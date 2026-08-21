@@ -25,5 +25,6 @@ target_sources(
          FILES
          error.cppm
          binding.cppm
+         module.cppm
          state.cppm
          lib.cppm)

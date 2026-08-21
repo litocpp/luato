@@ -44,6 +44,151 @@ auto fixture(ref<str> name) -> rstd::path::PathBuf {
   return result;
 }
 
+auto lua_source(ref<str> logical_name, ref<str> identity, ref<str> display_path,
+                ref<str> source) -> luato::LuaModuleSource {
+  return luato::LuaModuleSource{
+      String::make(logical_name), String::make(identity),
+      String::make(display_path), Vec<u8>::from(source.as_bytes())};
+}
+
+void expect_module_loader(Checks &checks) {
+  auto created = luato::State::create(luato::StateOptions::base());
+  checks.expect(created.is_ok(), "module loader state should be created");
+  if (created.is_err())
+    return;
+  auto state = rstd::move(created).unwrap_unchecked();
+  auto resolutions = usize();
+  auto configured = state.set_module_resolver(luato::ModuleResolverSpec::make(
+      [&resolutions](luato::ModuleRequest request)
+          -> luato::Result<luato::LuaModuleSource> {
+        ++resolutions;
+        if (request.requested == "pkg.api"_str) {
+          return Ok(lua_source("pkg.api"_str, "builtin:pkg/api"_str,
+                               "pkg/lua/api.lua"_str,
+                               "module_runs = (module_runs or 0) + 1\n"
+                               "local child = require('./child')\n"
+                               "return { value = 42, child = child }\n"_str));
+        }
+        if (request.requested == "./child"_str &&
+            request.importer_identity == "builtin:pkg/api"_str) {
+          return Ok(lua_source("pkg.api:./child"_str, "builtin:pkg/child"_str,
+                               "pkg/lua/child.lua"_str,
+                               "return 'nested'\n"_str));
+        }
+        if (request.requested == "工具.模块"_str) {
+          return Ok(lua_source("工具.模块"_str, "builtin:pkg/utf8"_str,
+                               "pkg/lua/工具.lua"_str, "return 'utf8'\n"_str));
+        }
+        if (request.requested == "pkg.syntax"_str) {
+          return Ok(lua_source("pkg.syntax"_str, "builtin:pkg/syntax"_str,
+                               "pkg/lua/syntax.lua"_str,
+                               "return function(\n"_str));
+        }
+        return Err(luato::Error::make(
+            luato::ErrorKind::Module, request.importer_path.clone(),
+            rstd::format("module '{}' was not found", request.requested)));
+      }));
+  checks.expect(configured.is_ok(), "module resolver should configure");
+
+  auto duplicate = state.set_module_resolver(luato::ModuleResolverSpec::make(
+      [](luato::ModuleRequest request)
+          -> luato::Result<luato::LuaModuleSource> {
+        return Err(luato::Error::make(luato::ErrorKind::Module,
+                                      rstd::move(request.importer_path),
+                                      String::make("unused"_str)));
+      }));
+  checks.expect(duplicate.is_err(), "module resolver should configure once");
+
+  auto executed = state.execute_entry(lua_source(
+      "entry"_str, "entry:module-contract"_str, "tests/module-entry.lua"_str,
+      "local first = require('pkg.api')\n"
+      "local second = require('pkg.api')\n"
+      "assert(first == second)\n"
+      "assert(first.value == 42)\n"
+      "assert(first.child == 'nested')\n"
+      "assert(module_runs == 1)\n"_str));
+  checks.expect(executed.is_ok(), "public and relative modules should load");
+  auto utf8 = state.execute_entry(
+      lua_source("utf8-entry"_str, "entry:utf8"_str, "tests/utf8-entry.lua"_str,
+                 "assert(require('工具.模块') == 'utf8')\n"_str));
+  checks.expect(utf8.is_ok(), "UTF-8 module names and paths should load");
+  checks.expect(
+      resolutions == usize(4),
+      "cached modules may resolve identity but should not execute again");
+  auto loaded = state.loaded_modules();
+  checks.expect(loaded.len() == usize(3),
+                "loaded module report should contain unique executed modules");
+  if (loaded.len() == usize(3)) {
+    checks.expect(loaded[usize()].identity == "builtin:pkg/child"_str,
+                  "relative module should be reported");
+    checks.expect(loaded[usize(1)].identity == "builtin:pkg/api"_str,
+                  "public module should be reported");
+    checks.expect(loaded[usize(2)].identity == "builtin:pkg/utf8"_str,
+                  "UTF-8 module should be reported");
+  }
+
+  auto syntax = state.execute_entry(
+      lua_source("syntax-entry"_str, "entry:syntax"_str,
+                 "tests/syntax-entry.lua"_str, "require('pkg.syntax')\n"_str));
+  checks.expect(syntax.is_err(), "imported module syntax errors should fail");
+  if (syntax.is_err()) {
+    auto error = rstd::move(syntax).unwrap_err_unchecked();
+    checks.expect(error.kind == luato::ErrorKind::Syntax,
+                  "imported syntax error should preserve its kind");
+    checks.expect(error.message.as_str().contains("syntax-entry"_str),
+                  "imported syntax error should preserve the import chain");
+  }
+
+  auto missing = state.execute_entry(lua_source(
+      "missing-entry"_str, "entry:missing"_str, "tests/missing-entry.lua"_str,
+      "require('pkg.missing')\n"_str));
+  checks.expect(missing.is_err(), "missing module should fail");
+  if (missing.is_err()) {
+    auto error = rstd::move(missing).unwrap_err_unchecked();
+    checks.expect(error.kind == luato::ErrorKind::Module,
+                  "missing module should use module error kind");
+    checks.expect(error.message.as_str().contains("pkg.missing"_str),
+                  "missing module error should preserve requested name");
+    checks.expect(error.message.as_str().contains("missing-entry"_str),
+                  "missing module error should preserve import chain");
+  }
+
+  auto cycle_state =
+      luato::State::create(luato::StateOptions::base()).unwrap_unchecked();
+  auto cycle_resolver =
+      cycle_state.set_module_resolver(luato::ModuleResolverSpec::make(
+          [](luato::ModuleRequest request)
+              -> luato::Result<luato::LuaModuleSource> {
+            if (request.requested == "cycle.a"_str ||
+                request.requested == "./a"_str) {
+              return Ok(lua_source("cycle.a"_str, "cycle:a"_str,
+                                   "cycle/a.lua"_str,
+                                   "return require('./b')\n"_str));
+            }
+            if (request.requested == "./b"_str) {
+              return Ok(lua_source("cycle.b"_str, "cycle:b"_str,
+                                   "cycle/b.lua"_str,
+                                   "return require('./a')\n"_str));
+            }
+            return Err(luato::Error::make(
+                luato::ErrorKind::Module, rstd::move(request.importer_path),
+                String::make("cycle module was not found"_str)));
+          }));
+  checks.expect(cycle_resolver.is_ok(), "cycle resolver should configure");
+  auto cycle = cycle_state.execute_entry(
+      lua_source("cycle-entry"_str, "entry:cycle"_str,
+                 "tests/cycle-entry.lua"_str, "require('cycle.a')\n"_str));
+  checks.expect(cycle.is_err(), "module cycle should fail");
+  if (cycle.is_err()) {
+    auto error = rstd::move(cycle).unwrap_err_unchecked();
+    checks.expect(error.kind == luato::ErrorKind::Module,
+                  "module cycle should use module error kind");
+    checks.expect(
+        error.message.as_str().contains("cycle.a -> cycle.b -> cycle.a"_str),
+        "module cycle should report the import chain");
+  }
+}
+
 void expect_lua_ffi(Checks &checks) {
   checks.expect(LUA_VERSION_NUM == 505,
                 "Lua FFI should export version constants");
@@ -90,11 +235,31 @@ int main() {
   int rejected_callback_drops{};
 
   expect_lua_ffi(checks);
+  expect_module_loader(checks);
 
   {
     auto minimal = luato::State::create(luato::StateOptions::none());
     checks.expect(minimal.is_ok(),
                   "state without standard libraries should be created");
+  }
+
+  {
+    auto created = luato::State::create(luato::StateOptions::build_script());
+    checks.expect(created.is_ok(), "build script Lua state should be created");
+    if (created.is_ok()) {
+      auto state = rstd::move(created).unwrap_unchecked();
+      auto executed = state.execute_entry(lua_source(
+          "entry"_str, "entry:build-script-libraries"_str,
+          "tests/build-script-libraries.lua"_str,
+          "assert(string.gsub('a-b', '-', '_') == 'a_b')\n"
+          "local values = { 'b', 'a' }\n"
+          "table.sort(values)\n"
+          "assert(values[1] == 'a')\n"
+          "assert(package == nil and io == nil and os == nil)\n"_str));
+      checks.expect(
+          executed.is_ok(),
+          "build script state should expose only safe helper libraries");
+    }
   }
 
   {

@@ -15,6 +15,7 @@ enum class ErrorKind {
   Memory,
   Binding,
   Type,
+  Module,
   PanicInvariant,
 };
 
