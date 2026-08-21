@@ -189,6 +189,82 @@ void expect_module_loader(Checks &checks) {
   }
 }
 
+void expect_native_require_module(Checks &checks) {
+  auto created = luato::State::create(luato::StateOptions::build_script());
+  checks.expect(created.is_ok(), "native require state should be created");
+  if (created.is_err())
+    return;
+  auto state = rstd::move(created).unwrap_unchecked();
+
+  auto host = luato::ModuleSpec(String::make("lito"_str));
+  host.set(String::make("api"_str), String::make("test"_str));
+  auto specification = luato::NativeRequireModuleSpec(
+      String::make("@lito"_str), String::make("host:lito:test"_str),
+      rstd::move(host));
+  specification.set_global_alias(String::make("lito"_str));
+  auto registered =
+      state.register_native_require_module(rstd::move(specification));
+  checks.expect(registered.is_ok(), "native require module should register");
+
+  auto resolver_calls = usize();
+  auto configured = state.set_module_resolver(luato::ModuleResolverSpec::make(
+      [&resolver_calls](luato::ModuleRequest request)
+          -> luato::Result<luato::LuaModuleSource> {
+        ++resolver_calls;
+        return Err(luato::Error::make(
+            luato::ErrorKind::Module, rstd::move(request.importer_path),
+            rstd::format("source module '{}' was not found",
+                         request.requested)));
+      }));
+  checks.expect(configured.is_ok(),
+                "native require test resolver should configure");
+
+  auto executed = state.execute_entry(lua_source(
+      "native-entry"_str, "entry:native"_str, "tests/native-entry.lua"_str,
+      "local first = require('@lito')\n"
+      "local second = require('@lito')\n"
+      "assert(first == second and first == lito)\n"
+      "assert(first.api == 'test')\n"
+      "assert(package == nil)\n"_str));
+  checks.expect(executed.is_ok(), "native require module should be cached");
+  checks.expect(resolver_calls == usize(),
+                "native require module should bypass the source resolver");
+  auto loaded = state.loaded_modules();
+  checks.expect(loaded.len() == usize(1),
+                "native require module should be reported once");
+  if (loaded.len() == usize(1)) {
+    checks.expect(loaded[usize()].logical_name == "@lito"_str,
+                  "native require report should preserve the require name");
+    checks.expect(loaded[usize()].identity == "host:lito:test"_str,
+                  "native require report should preserve the API identity");
+  }
+
+  auto duplicate_name_module = luato::ModuleSpec(String::make("other"_str));
+  auto duplicate_name =
+      state.register_native_require_module(luato::NativeRequireModuleSpec(
+          String::make("@lito"_str), String::make("host:other"_str),
+          rstd::move(duplicate_name_module)));
+  checks.expect(duplicate_name.is_err(),
+                "duplicate native require names should be rejected");
+
+  auto duplicate_identity_module =
+      luato::ModuleSpec(String::make("another"_str));
+  auto duplicate_identity =
+      state.register_native_require_module(luato::NativeRequireModuleSpec(
+          String::make("@another"_str), String::make("host:lito:test"_str),
+          rstd::move(duplicate_identity_module)));
+  checks.expect(duplicate_identity.is_err(),
+                "duplicate native require identities should be rejected");
+
+  auto shared_library = state.execute_entry(lua_source(
+      "shared-library-entry"_str, "entry:shared-library"_str,
+      "tests/shared-library-entry.lua"_str, "require('custom.so')\n"_str));
+  checks.expect(shared_library.is_err(),
+                "shared library requests should use the source resolver");
+  checks.expect(resolver_calls == usize(1),
+                "shared library requests should not use a native loader");
+}
+
 void expect_lua_ffi(Checks &checks) {
   checks.expect(LUA_VERSION_NUM == 505,
                 "Lua FFI should export version constants");
@@ -236,6 +312,7 @@ int main() {
 
   expect_lua_ffi(checks);
   expect_module_loader(checks);
+  expect_native_require_module(checks);
 
   {
     auto minimal = luato::State::create(luato::StateOptions::none());

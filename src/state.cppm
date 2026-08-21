@@ -67,6 +67,8 @@ public:
   static auto create(StateOptions options) -> Result<State>;
 
   auto register_module(ModuleSpec module) -> Result<empty>;
+  auto register_native_require_module(NativeRequireModuleSpec module)
+      -> Result<empty>;
   auto set_module_resolver(ModuleResolverSpec resolver) -> Result<empty>;
   auto execute_entry(LuaModuleSource source) -> Result<ExecutionReport>;
   auto execute_file(ref<rstd::path::Path> path) -> Result<ExecutionReport>;
@@ -75,6 +77,8 @@ public:
 private:
   explicit State(void *storage) noexcept : storage_(storage) {}
   static int dispatch(void *lua_state);
+  auto register_module_table(ModuleSpec module, Option<String> global_name,
+                             Option<String> native_identity) -> Result<empty>;
   void reset() noexcept;
 
   void *storage_;
@@ -105,10 +109,17 @@ struct ModuleFrame {
   String display_path;
 };
 
+struct NativeRequireModule {
+  String require_name;
+  String identity;
+  Option<String> global_alias;
+};
+
 struct StateStorage {
   lua_State *lua;
   Vec<Box<CallbackSlot>> callbacks;
   Vec<String> modules;
+  Vec<NativeRequireModule> native_require_modules;
   Option<Box<ModuleResolver>> module_resolver;
   Vec<ModuleFrame> module_stack;
   Vec<LoadedModule> loaded_modules;
@@ -116,8 +127,9 @@ struct StateStorage {
 
   explicit StateStorage(lua_State *state)
       : lua(state), callbacks(Vec<Box<CallbackSlot>>::make()),
-        modules(Vec<String>::make()), module_resolver(None()),
-        module_stack(Vec<ModuleFrame>::make()),
+        modules(Vec<String>::make()),
+        native_require_modules(Vec<NativeRequireModule>::make()),
+        module_resolver(None()), module_stack(Vec<ModuleFrame>::make()),
         loaded_modules(Vec<LoadedModule>::make()),
         pending_module_error(None()) {}
 
@@ -134,7 +146,8 @@ struct Invocation {
 
 struct RegistrationRequest {
   StateStorage *storage;
-  String const *module_name;
+  String const *global_name;
+  String const *native_identity;
   TableEntry const *fields;
   usize field_count;
   usize first_slot;
@@ -150,6 +163,7 @@ constexpr int ERROR_TRACEBACK = 5;
 
 char error_marker;
 char module_cache_marker;
+char native_module_marker;
 
 int raise_error(lua_State *state, const Error &error);
 
@@ -423,6 +437,30 @@ auto module_chunk_name(ref<str> display_path) -> Result<rstd::ffi::CString> {
 
 auto load_module(StateStorage &storage, lua_State *state, ref<str> requested)
     -> Result<int> {
+  for (const auto &module : storage.native_require_modules) {
+    if (module.require_name != requested)
+      continue;
+    if (!module_cache_get(state, module.identity.as_str())) {
+      lua_rawgetp(state, LUA_REGISTRYINDEX,
+                  static_cast<void *>(&native_module_marker));
+      auto modules = lua_gettop(state);
+      push_string(state, module.identity);
+      lua_rawget(state, modules);
+      if (lua_isnil(state, -1)) {
+        lua_pop(state, 2);
+        return Err(module_source_error(
+            storage, requested,
+            "registered native Lua module has no table"_str));
+      }
+      lua_remove(state, modules);
+      module_cache_set(state, module.identity.as_str(), -1);
+      storage.loaded_modules.push(LoadedModule{module.require_name.clone(),
+                                               module.identity.clone(),
+                                               module.require_name.clone()});
+    }
+    return Ok(1);
+  }
+
   if (storage.module_resolver.is_none()) {
     return Err(module_source_error(
         storage, requested,
@@ -564,6 +602,9 @@ int bootstrap_state(lua_State *state) {
   lua_createtable(state, 0, 0);
   lua_rawsetp(state, LUA_REGISTRYINDEX,
               static_cast<void *>(&module_cache_marker));
+  lua_createtable(state, 0, 0);
+  lua_rawsetp(state, LUA_REGISTRYINDEX,
+              static_cast<void *>(&native_module_marker));
   lua_pushcfunction(state, require_module);
   lua_setglobal(state, "require");
   return 0;
@@ -596,11 +637,23 @@ int register_module(lua_State *state) {
     lua_rawset(state, module);
   }
 
-  lua_pushglobaltable(state);
-  auto globals = lua_gettop(state);
-  push_string(state, *request->module_name);
-  lua_pushvalue(state, module);
-  lua_rawset(state, globals);
+  if (request->native_identity != nullptr) {
+    lua_rawgetp(state, LUA_REGISTRYINDEX,
+                static_cast<void *>(&native_module_marker));
+    auto modules = lua_gettop(state);
+    push_string(state, *request->native_identity);
+    lua_pushvalue(state, module);
+    lua_rawset(state, modules);
+    lua_pop(state, 1);
+  }
+  if (request->global_name != nullptr) {
+    lua_pushglobaltable(state);
+    auto globals = lua_gettop(state);
+    push_string(state, *request->global_name);
+    lua_pushvalue(state, module);
+    lua_rawset(state, globals);
+    lua_pop(state, 1);
+  }
   return 0;
 }
 
@@ -1082,6 +1135,69 @@ auto State::create(StateOptions options) -> Result<State> {
 }
 
 auto State::register_module(ModuleSpec module) -> Result<empty> {
+  auto global_name = module.name_.clone();
+  return register_module_table(rstd::move(module),
+                               Some(rstd::move(global_name)), None());
+}
+
+auto State::register_native_require_module(
+    NativeRequireModuleSpec specification) -> Result<empty> {
+  if (storage_ == nullptr)
+    return Err(moved_state_error());
+  auto *storage = static_cast<StateStorage *>(storage_);
+  if (specification.require_name_.is_empty()) {
+    return Err(Error::make(
+        ErrorKind::Binding, String::make(),
+        String::make("native require module name cannot be empty"_str)));
+  }
+  if (specification.identity_.is_empty()) {
+    return Err(Error::make(
+        ErrorKind::Binding, specification.require_name_.clone(),
+        String::make("native require module identity cannot be empty"_str)));
+  }
+  if (specification.global_alias_.is_some() &&
+      specification.global_alias_->is_empty()) {
+    return Err(Error::make(
+        ErrorKind::Binding, specification.require_name_.clone(),
+        String::make(
+            "native require module global alias cannot be empty"_str)));
+  }
+  for (const auto &registered : storage->native_require_modules) {
+    if (registered.require_name == specification.require_name_.as_str()) {
+      return Err(Error::make(
+          ErrorKind::Binding, specification.require_name_.clone(),
+          rstd::format("native require module '{}' is already registered",
+                       specification.require_name_.as_str())));
+    }
+    if (registered.identity == specification.identity_.as_str()) {
+      return Err(Error::make(
+          ErrorKind::Binding, specification.require_name_.clone(),
+          rstd::format(
+              "native require module identity '{}' is already registered",
+              specification.identity_.as_str())));
+    }
+  }
+
+  auto require_name = specification.require_name_.clone();
+  auto identity = specification.identity_.clone();
+  auto global_alias = specification.global_alias_.is_some()
+                          ? Some(specification.global_alias_->clone())
+                          : None();
+  auto registered = register_module_table(
+      rstd::move(specification.module_),
+      global_alias.is_some() ? Some(global_alias->clone()) : None(),
+      Some(identity.clone()));
+  if (registered.is_err())
+    return registered;
+  storage->native_require_modules.push(
+      NativeRequireModule{rstd::move(require_name), rstd::move(identity),
+                          rstd::move(global_alias)});
+  return Ok(empty{});
+}
+
+auto State::register_module_table(ModuleSpec module, Option<String> global_name,
+                                  Option<String> native_identity)
+    -> Result<empty> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
   auto *storage = static_cast<StateStorage *>(storage_);
@@ -1092,11 +1208,12 @@ auto State::register_module(ModuleSpec module) -> Result<empty> {
     return Err(Error::make(ErrorKind::Binding, String::make(),
                            String::make("module name cannot be empty"_str)));
   }
-  for (auto index = usize(); index < storage->modules.len(); ++index) {
-    if (storage->modules[index] == module.name_.as_str()) {
+  for (auto index = usize();
+       global_name.is_some() && index < storage->modules.len(); ++index) {
+    if (storage->modules[index] == global_name->as_str()) {
       return Err(Error::make(ErrorKind::Binding, module.name_.clone(),
                              rstd::format("module '{}' is already registered",
-                                          module.name_.as_str())));
+                                          global_name->as_str())));
     }
   }
   for (auto index = usize(); index < module.functions_.len(); ++index) {
@@ -1153,13 +1270,15 @@ auto State::register_module(ModuleSpec module) -> Result<empty> {
   auto dispatcher = +[](lua_State *state) -> int {
     return State::dispatch(static_cast<void *>(state));
   };
-  auto request = RegistrationRequest{storage,
-                                     rstd::addressof(module.name_),
-                                     module.fields_.data(),
-                                     module.fields_.len(),
-                                     first_slot,
-                                     module.functions_.len(),
-                                     dispatcher};
+  auto request = RegistrationRequest{
+      storage,
+      global_name.is_some() ? rstd::addressof(*global_name) : nullptr,
+      native_identity.is_some() ? rstd::addressof(*native_identity) : nullptr,
+      module.fields_.data(),
+      module.fields_.len(),
+      first_slot,
+      module.functions_.len(),
+      dispatcher};
 
   if (!lua_checkstack(lua, 2)) {
     storage->callbacks.truncate(first_slot);
@@ -1180,7 +1299,8 @@ auto State::register_module(ModuleSpec module) -> Result<empty> {
     return Err(rstd::move(error));
   }
 
-  storage->modules.push(rstd::move(module.name_));
+  if (global_name.is_some())
+    storage->modules.push(global_name.take().unwrap_unchecked());
   lua_settop(lua, old_top);
   return Ok(empty{});
 }

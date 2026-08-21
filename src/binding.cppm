@@ -470,4 +470,29 @@ private:
   friend class State;
 };
 
+class NativeRequireModuleSpec {
+public:
+  NativeRequireModuleSpec(String require_name, String identity,
+                          ModuleSpec module)
+      : require_name_(rstd::move(require_name)),
+        identity_(rstd::move(identity)), global_alias_(None()),
+        module_(rstd::move(module)) {}
+
+  NativeRequireModuleSpec(NativeRequireModuleSpec &&) noexcept = default;
+  auto operator=(NativeRequireModuleSpec &&) noexcept
+      -> NativeRequireModuleSpec & = default;
+
+  void set_global_alias(String alias) {
+    global_alias_ = Some(rstd::move(alias));
+  }
+
+private:
+  String require_name_;
+  String identity_;
+  Option<String> global_alias_;
+  ModuleSpec module_;
+
+  friend class State;
+};
+
 } // namespace luato
