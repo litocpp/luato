@@ -48,7 +48,7 @@ if(NOT TARGET rstd::rstd)
   FetchContent_Declare(
     rstd
     GIT_REPOSITORY https://github.com/litocpp/rstd.git
-    GIT_TAG b7b252b5fad3599974dd2c1899616205920c5000)
+    GIT_TAG c73625101b9c719517452a924fc868eee86ff982)
   FetchContent_MakeAvailable(rstd)
 endif()
 
@@ -58,7 +58,7 @@ add_subdirectory(src)
 if(LUATO_BUILD_TESTS)
   enable_testing()
 
-  add_executable(luato.contract tests/main.cpp)
+  add_executable(luato.contract tests/main.cpp tests/i18n.cpp)
   target_compile_features(luato.contract PRIVATE cxx_std_20)
   if(NOT luato_IS_TOP_LEVEL)
     target_compile_options(

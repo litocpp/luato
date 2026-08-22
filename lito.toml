@@ -10,7 +10,7 @@ archive = "luato"
 
 [[test]]
 name = "luato-contract"
-sources = ["tests/main.cpp"]
+sources = ["tests/main.cpp", "tests/i18n.cpp"]
 
 [usage]
 private-definitions = [
@@ -28,6 +28,14 @@ exceptions = false
 rtti = false
 
 [dependencies.rstd-std]
+git = "https://github.com/litocpp/rstd.git"
+visibility = "public"
+
+[dependencies.rstd-parse]
+git = "https://github.com/litocpp/rstd.git"
+visibility = "public"
+
+[dependencies.rstd-json]
 git = "https://github.com/litocpp/rstd.git"
 visibility = "public"
 

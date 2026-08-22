@@ -15,7 +15,13 @@ if(NOT luato_IS_TOP_LEVEL)
             "$<$<COMPILE_LANGUAGE:CXX>:-Wunknown-attributes>"
             "$<$<COMPILE_LANGUAGE:CXX>:-fsized-deallocation>")
 endif()
-target_link_libraries(luato.lib PUBLIC rstd::rstd luato::ffi::lua)
+target_link_libraries(
+  luato.lib
+  PUBLIC rstd::rstd
+         rstd::parse
+         rstd::json
+         luato::ffi::lua)
+target_sources(luato.lib PRIVATE i18n/mod.cpp)
 target_sources(
   luato.lib
   PUBLIC FILE_SET
@@ -27,4 +33,5 @@ target_sources(
          binding.cppm
          module_loader.cppm
          state.cppm
+         i18n/mod.cppm
          lib.cppm)

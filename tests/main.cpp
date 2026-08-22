@@ -1,5 +1,7 @@
 import luato;
 
+auto expect_i18n_contract() -> int;
+
 using namespace rstd::prelude;
 using namespace rstd::literals;
 
@@ -306,6 +308,7 @@ void expect_script_error(Checks &checks, luato::State &state,
 
 int main() {
   Checks checks;
+  checks.failures += expect_i18n_contract();
   int callback_drops{};
   int invocation_drops{};
   int rejected_callback_drops{};
