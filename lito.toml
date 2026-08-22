@@ -23,7 +23,7 @@ condition = 'target.os == "linux"'
 [when.usage]
 private-definitions = ["LUA_USE_LINUX"]
 
-[profile]
+[profile.base]
 exceptions = false
 rtti = false
 
