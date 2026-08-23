@@ -49,44 +49,24 @@ struct Token {
   Option<String> leading_note;
 };
 
-auto is_space(u8 byte) noexcept -> bool {
-  return byte == u8(' ') || byte == u8('\t') || byte == u8('\n') ||
-         byte == u8('\r') || byte == u8('\f') || byte == u8('\v');
-}
-
-auto is_digit(u8 byte) noexcept -> bool {
-  return byte >= u8('0') && byte <= u8('9');
-}
-
-auto is_hex(u8 byte) noexcept -> bool {
-  return is_digit(byte) || (byte >= u8('a') && byte <= u8('f')) ||
-         (byte >= u8('A') && byte <= u8('F'));
-}
-
 auto hex_value(u8 byte) noexcept -> u8 {
-  if (is_digit(byte))
-    return byte - u8('0');
-  if (byte >= u8('a') && byte <= u8('f'))
-    return byte - u8('a') + u8(10);
-  return byte - u8('A') + u8(10);
+  return *rstd::ascii::digit_value(byte, u8(16));
 }
 
 auto is_name_start(u8 byte) noexcept -> bool {
-  return byte == u8('_') || (byte >= u8('a') && byte <= u8('z')) ||
-         (byte >= u8('A') && byte <= u8('Z'));
+  return byte == u8('_') || rstd::ascii::is_alpha(byte);
 }
 
 auto is_name_continue(u8 byte) noexcept -> bool {
-  return is_name_start(byte) || is_digit(byte);
+  return byte == u8('_') || rstd::ascii::is_alnum(byte);
 }
 
 auto trim_ascii(ref<str> value) noexcept -> ref<str> {
   usize begin{};
   usize end = value.size();
-  while (begin < end && (value[begin] == u8(' ') || value[begin] == u8('\t')))
+  while (begin < end && rstd::ascii::is_blank(value[begin]))
     ++begin;
-  while (end > begin && (value[end - usize(1)] == u8(' ') ||
-                         value[end - usize(1)] == u8('\t')))
+  while (end > begin && rstd::ascii::is_blank(value[end - usize(1)]))
     --end;
   return subtext(value, begin, end);
 }
@@ -188,7 +168,7 @@ class Lexer {
 
   auto skip_trivia() -> bool {
     while (!cursor_.is_eof()) {
-      if (is_space(*byte())) {
+      if (rstd::ascii::is_space(*byte())) {
         if ((*byte() == u8('\n') || *byte() == u8('\r')) &&
             pending_note_.is_some() && pending_note_has_token_) {
           pending_note_ = None();
@@ -328,12 +308,13 @@ class Lexer {
         output.push(u8('\n'));
         break;
       case 'z':
-        while (!cursor_.is_eof() && is_space(*byte()))
+        while (!cursor_.is_eof() && rstd::ascii::is_space(*byte()))
           cursor_.advance(usize(1));
         break;
       case 'x': {
-        if (byte().is_none() || byte(usize(1)).is_none() || !is_hex(*byte()) ||
-            !is_hex(*byte(usize(1)))) {
+        if (byte().is_none() || byte(usize(1)).is_none() ||
+            !rstd::ascii::is_hex_digit(*byte()) ||
+            !rstd::ascii::is_hex_digit(*byte(usize(1)))) {
           fail({begin, cursor_.position()}, "invalid hexadecimal escape"_str);
           return false;
         }
@@ -350,7 +331,7 @@ class Lexer {
         cursor_.advance(usize(1));
         char32_t value{};
         usize digits{};
-        while (byte().is_some() && is_hex(*byte())) {
+        while (byte().is_some() && rstd::ascii::is_hex_digit(*byte())) {
           if (digits == usize(8)) {
             fail({begin, cursor_.position()}, "Unicode escape is too long"_str);
             return false;
@@ -373,10 +354,11 @@ class Lexer {
         break;
       }
       default:
-        if (is_digit(escaped)) {
+        if (rstd::ascii::is_digit(escaped)) {
           unsigned value = unsigned((escaped - u8('0')).to_primitive());
           usize digits = usize(1);
-          while (digits < usize(3) && byte().is_some() && is_digit(*byte())) {
+          while (digits < usize(3) && byte().is_some() &&
+                 rstd::ascii::is_digit(*byte())) {
             value = value * 10U + unsigned((*byte() - u8('0')).to_primitive());
             ++digits;
             cursor_.advance(usize(1));
@@ -405,13 +387,15 @@ class Lexer {
       cursor_.advance(usize(2));
     }
     usize digits{};
-    while (byte().is_some() && (hex ? is_hex(*byte()) : is_digit(*byte()))) {
+    while (byte().is_some() && (hex ? rstd::ascii::is_hex_digit(*byte())
+                                    : rstd::ascii::is_digit(*byte()))) {
       ++digits;
       cursor_.advance(usize(1));
     }
     if (byte() == Some(u8('.')) && byte(usize(1)) != Some(u8('.'))) {
       cursor_.advance(usize(1));
-      while (byte().is_some() && (hex ? is_hex(*byte()) : is_digit(*byte()))) {
+      while (byte().is_some() && (hex ? rstd::ascii::is_hex_digit(*byte())
+                                      : rstd::ascii::is_digit(*byte()))) {
         ++digits;
         cursor_.advance(usize(1));
       }
@@ -428,7 +412,7 @@ class Lexer {
       if (byte() == Some(u8('+')) || byte() == Some(u8('-')))
         cursor_.advance(usize(1));
       usize exponent_digits{};
-      while (byte().is_some() && is_digit(*byte())) {
+      while (byte().is_some() && rstd::ascii::is_digit(*byte())) {
         ++exponent_digits;
         cursor_.advance(usize(1));
       }
@@ -501,9 +485,9 @@ public:
         while (byte().is_some() && is_name_continue(*byte()))
           cursor_.advance(usize(1));
         emit(TokenKind::Name, begin);
-      } else if (is_digit(current) ||
+      } else if (rstd::ascii::is_digit(current) ||
                  (current == u8('.') && byte(usize(1)).is_some() &&
-                  is_digit(*byte(usize(1))))) {
+                  rstd::ascii::is_digit(*byte(usize(1))))) {
         if (!scan_number())
           return Err(rstd::move(*error_));
       } else if (current == u8('"') || current == u8('\'')) {
