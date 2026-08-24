@@ -35,10 +35,6 @@ visibility = "public"
 git = "https://github.com/litocpp/rstd.git"
 visibility = "public"
 
-[dependencies.rstd-json]
-git = "https://github.com/litocpp/rstd.git"
-visibility = "public"
-
 [dependencies.luato-lua]
 path = "src/lua"
 visibility = "public"

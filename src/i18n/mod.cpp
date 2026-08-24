@@ -524,8 +524,7 @@ struct ExprInfo {
 };
 
 struct FoundCall {
-  String id;
-  String fallback;
+  String msgid;
   Occurrence occurrence;
 };
 
@@ -649,6 +648,16 @@ class Parser {
     return true;
   }
 
+  auto references_reserved(const ExprInfo &expression) const noexcept -> bool {
+    if (!expression.has_qualified || expression.qualified.is_empty())
+      return false;
+    if (is_reserved(expression.qualified[usize()].as_str()))
+      return true;
+    return expression.qualified.len() == usize(2) &&
+           expression.qualified[usize()].as_str() == "_ENV"_str &&
+           is_reserved(expression.qualified[usize(1)].as_str());
+  }
+
   auto parse_expression_list(Vec<ExprInfo> &values) -> bool {
     ExprInfo first;
     if (!parse_expression(first))
@@ -732,31 +741,34 @@ class Parser {
 
   auto record_call(const ExprInfo &callee, const Vec<ExprInfo> &arguments,
                    usize end) -> bool {
-    if (!same_callee(callee))
+    if (!same_callee(callee)) {
+      if (references_reserved(callee)) {
+        fail(
+            DiagnosticCode::InvalidTranslationCall, {callee.span.begin, end},
+            "reserved host global must use the canonical translation call"_str);
+        return false;
+      }
       return true;
+    }
     if (arguments.len() != options_.call.exact_argument_count ||
-        options_.call.id_argument >= arguments.len() ||
-        options_.call.fallback_argument >= arguments.len() ||
-        arguments[options_.call.id_argument].literal.is_none() ||
-        arguments[options_.call.fallback_argument].literal.is_none()) {
+        options_.call.message_argument >= arguments.len() ||
+        arguments[options_.call.message_argument].literal.is_none()) {
       fail(
           DiagnosticCode::InvalidTranslationCall, {callee.span.begin, end},
-          "canonical translation call requires exactly two string literals"_str);
+          "canonical translation call requires exactly one string literal"_str);
       return false;
     }
-    const auto &id = arguments[options_.call.id_argument];
-    const auto &fallback = arguments[options_.call.fallback_argument];
-    if (id.literal->is_empty()) {
-      fail(DiagnosticCode::EmptyMessageId, id.span,
+    const auto &message = arguments[options_.call.message_argument];
+    if (message.literal->is_empty()) {
+      fail(DiagnosticCode::EmptyMessageId, message.span,
            "translation message id cannot be empty"_str);
       return false;
     }
     calls_.push(FoundCall{
-        id.literal->clone(), fallback.literal->clone(),
+        message.literal->clone(),
         Occurrence{source_.clone(),
                    {callee.span.begin, end},
-                   id.span,
-                   fallback.span,
+                   message.span,
                    source_position(text_.as_bytes(), callee.span.begin),
                    callee.leading_note.is_some()
                        ? Some(callee.leading_note->clone())
@@ -830,12 +842,21 @@ class Parser {
         ExprInfo index;
         if (!parse_expression(index) || !expect("]"_str))
           return false;
+        const bool reserved_env_access =
+            output.has_qualified && output.qualified.len() == usize(1) &&
+            output.qualified[usize()].as_str() == "_ENV"_str &&
+            index.literal.is_some() && is_reserved(index.literal->as_str());
         output.span.end =
             cursor_.input()[cursor_.position() - usize(1)].span.end;
         output.qualified.clear();
         output.leading_note = None();
         output.has_qualified = false;
         output.assignable = true;
+        if (reserved_env_access) {
+          fail(DiagnosticCode::InvalidTranslationCall, output.span,
+               "reserved host global cannot be accessed through _ENV"_str);
+          return false;
+        }
       } else if (consume(":"_str)) {
         const Token *name{};
         if (!expect_name(name))
@@ -865,6 +886,11 @@ class Parser {
       } else {
         break;
       }
+    }
+    if (references_reserved(output) && !output.is_call) {
+      fail(DiagnosticCode::InvalidTranslationCall, output.span,
+           "reserved host global cannot be aliased or used as a value"_str);
+      return false;
     }
     return true;
   }
@@ -1211,6 +1237,42 @@ auto contains_note(const Vec<String> &notes, ref<str> value) noexcept -> bool {
   return false;
 }
 
+void merge_message(BTreeMap<String, Message> &messages, Message message) {
+  auto existing = messages.get_mut(message.msgid.as_str());
+  if (existing.is_none()) {
+    auto msgid = message.msgid.clone();
+    messages.insert(rstd::move(msgid), rstd::move(message));
+    return;
+  }
+
+  for (auto &note : message.translator_notes) {
+    if (!contains_note((*existing)->translator_notes, note.as_str()))
+      (*existing)->translator_notes.push(rstd::move(note));
+  }
+  for (auto &occurrence : message.occurrences)
+    (*existing)->occurrences.push(rstd::move(occurrence));
+}
+
+auto finish_extraction(BTreeMap<String, Message> messages,
+                       Vec<Diagnostic> warnings) -> Extraction {
+  auto output = Vec<Message>::with_capacity(messages.len());
+  while (auto entry = messages.pop_first())
+    output.push(rstd::move(entry->template get<1>()));
+  return Extraction{rstd::move(output), rstd::move(warnings)};
+}
+
+auto merge_extractions(Vec<Extraction> extractions) -> Extraction {
+  auto messages = BTreeMap<String, Message>::make();
+  auto warnings = Vec<Diagnostic>::make();
+  for (auto &extraction : extractions) {
+    for (auto &warning : extraction.warnings)
+      warnings.push(rstd::move(warning));
+    for (auto &message : extraction.messages)
+      merge_message(messages, rstd::move(message));
+  }
+  return finish_extraction(rstd::move(messages), rstd::move(warnings));
+}
+
 auto extract(slice<SourceFile> sources, const ExtractionOptions &options)
     -> Result<Extraction> {
   auto messages = BTreeMap<String, Message>::make();
@@ -1241,426 +1303,17 @@ auto extract(slice<SourceFile> sources, const ExtractionOptions &options)
       return Err(rstd::move(parsed).unwrap_err_unchecked());
     auto calls = rstd::move(parsed).unwrap_unchecked();
     for (auto &call : calls) {
-      auto existing = messages.get_mut(call.id.as_str());
-      if (existing.is_some()) {
-        if ((*existing)->fallback.as_str() != call.fallback.as_str()) {
-          auto conflict =
-              diagnostic(DiagnosticCode::DuplicateFallback, source.source,
-                         source.bytes, call.occurrence.fallback_span,
-                         "message id is used with a different fallback"_str);
-          const auto &original = (*existing)->occurrences[usize()];
-          conflict.related.push(RelatedLocation{
-              original.source.clone(), original.fallback_span,
-              original.position,
-              String::make("first fallback for this message id"_str)});
-          return Err(rstd::move(conflict));
-        }
-        if (call.occurrence.translator_note.is_some() &&
-            !contains_note((*existing)->translator_notes,
-                           call.occurrence.translator_note->as_str())) {
-          (*existing)->translator_notes.push(
-              call.occurrence.translator_note->clone());
-        }
-        (*existing)->occurrences.push(rstd::move(call.occurrence));
-        continue;
-      }
       auto notes = Vec<String>::make();
       if (call.occurrence.translator_note.is_some())
         notes.push(call.occurrence.translator_note->clone());
-      auto id_key = call.id.clone();
       auto occurrences = Vec<Occurrence>::make();
       occurrences.push(rstd::move(call.occurrence));
-      messages.insert(rstd::move(id_key),
-                      Message{rstd::move(call.id), rstd::move(call.fallback),
-                              rstd::move(occurrences), rstd::move(notes)});
+      merge_message(messages,
+                    Message{rstd::move(call.msgid), rstd::move(occurrences),
+                            rstd::move(notes)});
     }
   }
-
-  auto output = Vec<Message>::with_capacity(messages.len());
-  while (auto entry = messages.pop_first())
-    output.push(rstd::move(entry->template get<1>()));
-  return Ok(Extraction{rstd::move(output), Vec<Diagnostic>::make()});
-}
-
-auto catalog_error(DiagnosticCode code, const rstd::parse::SourceId &source,
-                   ref<str> document, ref<str> message,
-                   rstd::parse::SourcePosition position = {}) -> Diagnostic {
-  usize offset{};
-  auto current = rstd::parse::SourcePosition{};
-  while (offset < document.size() &&
-         (current.line < position.line || current.column < position.column)) {
-    if (document[offset] == u8('\n')) {
-      ++current.line;
-      current.column = usize(1);
-    } else {
-      ++current.column;
-    }
-    ++offset;
-  }
-  return diagnostic(code, source, document.as_bytes(), {offset, offset},
-                    message);
-}
-
-auto valid_locale(ref<str> locale) noexcept -> bool {
-  if (locale.is_empty() || locale[usize()] == u8('-') ||
-      locale[locale.size() - usize(1)] == u8('-'))
-    return false;
-  bool previous_hyphen{};
-  for (u8 byte : locale.as_bytes()) {
-    if (byte == u8('-')) {
-      if (previous_hyphen)
-        return false;
-      previous_hyphen = true;
-      continue;
-    }
-    previous_hyphen = false;
-    if (!is_name_continue(byte) || byte == u8('_'))
-      return false;
-  }
-  return true;
-}
-
-auto known_field(ref<str> name, slice<ref<str>> allowed) noexcept -> bool {
-  for (auto field : allowed) {
-    if (field == name)
-      return true;
-  }
-  return false;
-}
-
-auto reject_unknown(const rstd::json::Map &object, slice<ref<str>> allowed,
-                    const rstd::parse::SourceId &source, ref<str> document,
-                    ref<str> context) -> Result<empty> {
-  for (auto item : object.iter()) {
-    auto [key, value] = item;
-    (void)value;
-    if (!known_field(key->as_str(), allowed)) {
-      return Err(catalog_error(
-          DiagnosticCode::InvalidCatalog, source, document,
-          rstd::format("unknown field '{}' in {}", key->as_str(), context)
-              .as_str()));
-    }
-  }
-  return Ok(empty{});
-}
-
-auto required_value(const rstd::json::Map &object, ref<str> key,
-                    const rstd::parse::SourceId &source, ref<str> document,
-                    ref<str> context) -> Result<ref<rstd::json::Value>> {
-  auto value = object.get(key);
-  if (value.is_none()) {
-    return Err(catalog_error(
-        DiagnosticCode::InvalidCatalog, source, document,
-        rstd::format("missing field '{}.{}'", context, key).as_str()));
-  }
-  return Ok(*value);
-}
-
-auto required_string(const rstd::json::Map &object, ref<str> key,
-                     const rstd::parse::SourceId &source, ref<str> document,
-                     ref<str> context) -> Result<String> {
-  auto value = required_value(object, key, source, document, context);
-  if (value.is_err())
-    return Err(rstd::move(value).unwrap_err_unchecked());
-  auto string = (*value)->as_str();
-  if (string.is_none()) {
-    return Err(catalog_error(
-        DiagnosticCode::InvalidCatalog, source, document,
-        rstd::format("field '{}.{}' must be a string", context, key).as_str()));
-  }
-  return Ok(String::make(*string));
-}
-
-auto parse_entry(const rstd::parse::SourceId &source, ref<str> document,
-                 ref<str> id, const rstd::json::Value &value)
-    -> Result<CatalogEntry> {
-  auto object = value.as_object();
-  if (object.is_none()) {
-    return Err(catalog_error(
-        DiagnosticCode::InvalidCatalog, source, document,
-        rstd::format("message '{}' must be an object", id).as_str()));
-  }
-  static constexpr auto allowed = rstd::array<ref<str>, 5>{
-      "source"_str, "translation"_str, "references"_str, "note"_str,
-      "needs_review"_str};
-  auto checked = reject_unknown(**object, allowed.as_slice(), source, document,
-                                "message entry"_str);
-  if (checked.is_err())
-    return Err(rstd::move(checked).unwrap_err_unchecked());
-  auto fallback = required_string(**object, "source"_str, source, document, id);
-  if (fallback.is_err())
-    return Err(rstd::move(fallback).unwrap_err_unchecked());
-  auto translation =
-      required_string(**object, "translation"_str, source, document, id);
-  if (translation.is_err())
-    return Err(rstd::move(translation).unwrap_err_unchecked());
-  auto references_value =
-      required_value(**object, "references"_str, source, document, id);
-  if (references_value.is_err())
-    return Err(rstd::move(references_value).unwrap_err_unchecked());
-  auto references_array = (*references_value)->as_array();
-  if (references_array.is_none()) {
-    return Err(catalog_error(
-        DiagnosticCode::InvalidCatalog, source, document,
-        rstd::format("field '{}.references' must be an array", id).as_str()));
-  }
-  auto references = Vec<String>::make();
-  for (const auto &item : **references_array) {
-    auto reference = item.as_str();
-    if (reference.is_none()) {
-      return Err(catalog_error(
-          DiagnosticCode::InvalidCatalog, source, document,
-          rstd::format("field '{}.references' must contain strings", id)
-              .as_str()));
-    }
-    references.push(String::make(*reference));
-  }
-  Option<String> note;
-  auto note_value = (**object).get("note"_str);
-  if (note_value.is_some()) {
-    auto note_text = (*note_value)->as_str();
-    if (note_text.is_none()) {
-      return Err(catalog_error(
-          DiagnosticCode::InvalidCatalog, source, document,
-          rstd::format("field '{}.note' must be a string", id).as_str()));
-    }
-    note = Some(String::make(*note_text));
-  }
-  bool needs_review{};
-  auto review_value = (**object).get("needs_review"_str);
-  if (review_value.is_some()) {
-    auto review = (*review_value)->as_bool();
-    if (review.is_none()) {
-      return Err(catalog_error(
-          DiagnosticCode::InvalidCatalog, source, document,
-          rstd::format("field '{}.needs_review' must be a boolean", id)
-              .as_str()));
-    }
-    needs_review = *review;
-  }
-  return Ok(CatalogEntry{rstd::move(fallback).unwrap_unchecked(),
-                         rstd::move(translation).unwrap_unchecked(),
-                         rstd::move(references), rstd::move(note),
-                         needs_review});
-}
-
-auto parse_entry_map(const rstd::parse::SourceId &source, ref<str> document,
-                     const rstd::json::Value &value, ref<str> field)
-    -> Result<BTreeMap<String, CatalogEntry>> {
-  auto object = value.as_object();
-  if (object.is_none()) {
-    return Err(catalog_error(
-        DiagnosticCode::InvalidCatalog, source, document,
-        rstd::format("field '{}' must be an object", field).as_str()));
-  }
-  auto entries = BTreeMap<String, CatalogEntry>::make();
-  for (auto item : (**object).iter()) {
-    auto [id, entry_value] = item;
-    if (id->is_empty()) {
-      return Err(catalog_error(DiagnosticCode::InvalidCatalog, source, document,
-                               "catalog message id cannot be empty"_str));
-    }
-    auto entry = parse_entry(source, document, id->as_str(), *entry_value);
-    if (entry.is_err())
-      return Err(rstd::move(entry).unwrap_err_unchecked());
-    entries.insert(id->clone(), rstd::move(entry).unwrap_unchecked());
-  }
-  return Ok(rstd::move(entries));
-}
-
-auto parse_catalog(rstd::parse::SourceId source, ref<str> expected_locale,
-                   ref<str> document) -> Result<Catalog> {
-  if (!valid_locale(expected_locale)) {
-    return Err(catalog_error(DiagnosticCode::LocaleMismatch, source, document,
-                             "invalid locale tag"_str));
-  }
-  auto parsed = rstd::json::from_str(
-      document, rstd::json::ParseOptions{.reject_duplicate_keys = true});
-  if (parsed.is_err()) {
-    auto error = rstd::move(parsed).unwrap_err_unchecked();
-    return Err(
-        catalog_error(DiagnosticCode::InvalidCatalog, source, document,
-                      rstd::format("invalid catalog JSON: {}", error).as_str(),
-                      {error.line(), error.column()}));
-  }
-  auto root = rstd::move(parsed).unwrap_unchecked();
-  auto object = root.as_object();
-  if (object.is_none()) {
-    return Err(catalog_error(DiagnosticCode::InvalidCatalog, source, document,
-                             "catalog root must be an object"_str));
-  }
-  static constexpr auto allowed = rstd::array<ref<str>, 4>{
-      "version"_str, "locale"_str, "messages"_str, "obsolete"_str};
-  auto checked = reject_unknown(**object, allowed.as_slice(), source, document,
-                                "catalog"_str);
-  if (checked.is_err())
-    return Err(rstd::move(checked).unwrap_err_unchecked());
-  auto version_value =
-      required_value(**object, "version"_str, source, document, "catalog"_str);
-  if (version_value.is_err())
-    return Err(rstd::move(version_value).unwrap_err_unchecked());
-  if ((*version_value)->as_u64() != Some(u64(1))) {
-    return Err(catalog_error(DiagnosticCode::InvalidCatalog, source, document,
-                             "catalog version must be 1"_str));
-  }
-  auto locale =
-      required_string(**object, "locale"_str, source, document, "catalog"_str);
-  if (locale.is_err())
-    return Err(rstd::move(locale).unwrap_err_unchecked());
-  if (locale->as_str() != expected_locale) {
-    return Err(
-        catalog_error(DiagnosticCode::LocaleMismatch, source, document,
-                      rstd::format("catalog locale '{}' does not match '{}'",
-                                   locale->as_str(), expected_locale)
-                          .as_str()));
-  }
-  auto messages_value =
-      required_value(**object, "messages"_str, source, document, "catalog"_str);
-  if (messages_value.is_err())
-    return Err(rstd::move(messages_value).unwrap_err_unchecked());
-  auto messages =
-      parse_entry_map(source, document, **messages_value, "messages"_str);
-  if (messages.is_err())
-    return Err(rstd::move(messages).unwrap_err_unchecked());
-  auto obsolete_value =
-      required_value(**object, "obsolete"_str, source, document, "catalog"_str);
-  if (obsolete_value.is_err())
-    return Err(rstd::move(obsolete_value).unwrap_err_unchecked());
-  auto obsolete =
-      parse_entry_map(source, document, **obsolete_value, "obsolete"_str);
-  if (obsolete.is_err())
-    return Err(rstd::move(obsolete).unwrap_err_unchecked());
-  return Ok(Catalog{rstd::move(locale).unwrap_unchecked(),
-                    rstd::move(messages).unwrap_unchecked(),
-                    rstd::move(obsolete).unwrap_unchecked()});
-}
-
-auto entry_value(const CatalogEntry &entry) -> rstd::json::Value {
-  auto object = rstd::json::Map::make();
-  object.insert(String::make("source"_str),
-                rstd::json::Value::String(entry.source.clone()));
-  object.insert(String::make("translation"_str),
-                rstd::json::Value::String(entry.translation.clone()));
-  auto references = rstd::json::Array::with_capacity(entry.references.len());
-  for (const auto &reference : entry.references)
-    references.push(rstd::json::Value::String(reference.clone()));
-  object.insert(String::make("references"_str),
-                rstd::json::Value::Array(rstd::move(references)));
-  if (entry.note.is_some()) {
-    object.insert(String::make("note"_str),
-                  rstd::json::Value::String(entry.note->clone()));
-  }
-  if (entry.needs_review) {
-    object.insert(String::make("needs_review"_str),
-                  rstd::json::Value::Bool(true));
-  }
-  return rstd::json::Value::Object(rstd::move(object));
-}
-
-auto entry_map_value(const BTreeMap<String, CatalogEntry> &entries)
-    -> rstd::json::Value {
-  auto object = rstd::json::Map::make();
-  for (auto item : entries.iter()) {
-    auto [id, entry] = item;
-    object.insert(id->clone(), entry_value(*entry));
-  }
-  return rstd::json::Value::Object(rstd::move(object));
-}
-
-auto render_catalog(const Catalog &catalog) -> String {
-  auto object = rstd::json::Map::make();
-  object.insert(
-      String::make("version"_str),
-      rstd::json::Value::Number(rstd::json::Number::from_u64(u64(1))));
-  object.insert(String::make("locale"_str),
-                rstd::json::Value::String(catalog.locale.clone()));
-  object.insert(String::make("messages"_str),
-                entry_map_value(catalog.messages));
-  object.insert(String::make("obsolete"_str),
-                entry_map_value(catalog.obsolete));
-  auto output = rstd::json::to_string(
-      rstd::json::Value::Object(rstd::move(object)),
-      rstd::json::FormatOptions{.pretty = true, .indent = usize(2)});
-  output.push_ascii('\n');
-  return output;
-}
-
-auto occurrence_references(const Message &message) -> Vec<String> {
-  auto references = BTreeMap<String, empty>::make();
-  for (const auto &occurrence : message.occurrences) {
-    references.insert(rstd::format("{}:{}", occurrence.source.as_str(),
-                                   occurrence.position.line),
-                      empty{});
-  }
-  auto output = Vec<String>::with_capacity(references.len());
-  while (auto item = references.pop_first())
-    output.push(rstd::move(item->template get<0>()));
-  return output;
-}
-
-auto joined_notes(const Message &message) -> Option<String> {
-  if (message.translator_notes.is_empty())
-    return None();
-  auto note = String::make();
-  for (usize index{}; index < message.translator_notes.len(); ++index) {
-    if (index != usize())
-      note.push_ascii('\n');
-    note.push_str(message.translator_notes[index].as_str());
-  }
-  return Some(rstd::move(note));
-}
-
-auto update_catalog(rstd::parse::SourceId source, ref<str> locale,
-                    Option<ref<str>> existing, const Extraction &extraction)
-    -> Result<String> {
-  Catalog catalog{String::make(locale), BTreeMap<String, CatalogEntry>::make(),
-                  BTreeMap<String, CatalogEntry>::make()};
-  if (existing.is_some()) {
-    auto parsed = parse_catalog(source.clone(), locale, *existing);
-    if (parsed.is_err())
-      return Err(rstd::move(parsed).unwrap_err_unchecked());
-    catalog = rstd::move(parsed).unwrap_unchecked();
-  } else if (!valid_locale(locale)) {
-    return Err(catalog_error(DiagnosticCode::LocaleMismatch, source, {},
-                             "invalid locale tag"_str));
-  }
-
-  auto current = BTreeMap<String, CatalogEntry>::make();
-  for (const auto &message : extraction.messages) {
-    auto prior = catalog.messages.remove(message.id.as_str());
-    if (prior.is_none())
-      prior = catalog.obsolete.remove(message.id.as_str());
-    CatalogEntry entry{message.fallback.clone(), String::make(),
-                       occurrence_references(message), joined_notes(message),
-                       false};
-    if (prior.is_some()) {
-      entry.translation = prior->translation.clone();
-      entry.needs_review = prior->needs_review;
-      if (prior->source.as_str() != message.fallback.as_str())
-        entry.needs_review = true;
-    }
-    current.insert(message.id.clone(), rstd::move(entry));
-  }
-  while (auto stale = catalog.messages.pop_first())
-    catalog.obsolete.insert(rstd::move(stale->template get<0>()),
-                            rstd::move(stale->template get<1>()));
-  catalog.messages = rstd::move(current);
-  return Ok(render_catalog(catalog));
-}
-
-auto check_catalog(rstd::parse::SourceId source, ref<str> locale,
-                   ref<str> document, const Extraction &extraction)
-    -> Result<empty> {
-  auto updated =
-      update_catalog(source.clone(), locale, Some(document), extraction);
-  if (updated.is_err())
-    return Err(rstd::move(updated).unwrap_err_unchecked());
-  if (updated->as_str() != document) {
-    return Err(
-        catalog_error(DiagnosticCode::CatalogDrift, source, document,
-                      "catalog is not synchronized with Lua sources"_str));
-  }
-  return Ok(empty{});
+  return Ok(finish_extraction(rstd::move(messages), Vec<Diagnostic>::make()));
 }
 
 auto code_name(DiagnosticCode code) noexcept -> ref<str> {
@@ -1677,16 +1330,6 @@ auto code_name(DiagnosticCode code) noexcept -> ref<str> {
     return "invalid-translation-call"_str;
   case DiagnosticCode::EmptyMessageId:
     return "empty-message-id"_str;
-  case DiagnosticCode::DuplicateFallback:
-    return "duplicate-fallback"_str;
-  case DiagnosticCode::InvalidCatalog:
-    return "invalid-catalog"_str;
-  case DiagnosticCode::LocaleMismatch:
-    return "locale-mismatch"_str;
-  case DiagnosticCode::CatalogDrift:
-    return "catalog-drift"_str;
-  case DiagnosticCode::UnsafePluginPath:
-    return "unsafe-plugin-path"_str;
   }
   rstd::unreachable();
 }
