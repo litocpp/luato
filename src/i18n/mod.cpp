@@ -750,12 +750,13 @@ class Parser {
       }
       return true;
     }
-    if (arguments.len() != options_.call.exact_argument_count ||
-        options_.call.message_argument >= arguments.len() ||
+    if (options_.call.message_argument >= arguments.len() ||
+        (options_.call.maximum_argument_count.is_some() &&
+         arguments.len() > *options_.call.maximum_argument_count) ||
         arguments[options_.call.message_argument].literal.is_none()) {
       fail(
           DiagnosticCode::InvalidTranslationCall, {callee.span.begin, end},
-          "canonical translation call requires exactly one string literal"_str);
+          "canonical translation call has invalid arguments or a non-literal message id"_str);
       return false;
     }
     const auto &message = arguments[options_.call.message_argument];

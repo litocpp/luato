@@ -22,8 +22,14 @@ auto options() -> luato::i18n::ExtractionOptions {
   auto callee = Vec<String>::make();
   callee.push(String::make("tr"_str));
   return luato::i18n::ExtractionOptions{luato::i18n::CallSpec{
-      rstd::move(callee), usize(), usize(1), String::make("TRANSLATORS:"_str),
-      Some(String::make("tr"_str))}};
+      rstd::move(callee), usize(), Some(usize(1)),
+      String::make("TRANSLATORS:"_str), Some(String::make("tr"_str))}};
+}
+
+auto variadic_options() -> luato::i18n::ExtractionOptions {
+  auto value = options();
+  value.call.maximum_argument_count = None();
+  return value;
 }
 
 auto one_source(ref<str> path, ref<str> text) -> Vec<luato::i18n::SourceFile> {
@@ -71,6 +77,24 @@ void expect_extraction(Checks &checks) {
                 "short string escapes should decode once");
   checks.expect(value.messages[usize(1)].translator_notes.len() == usize(1),
                 "adjacent translator comments should attach");
+}
+
+void expect_variadic_extraction(Checks &checks) {
+  auto sources = one_source(
+      "plugin/arguments.lua"_str,
+      "local status = 503\nreturn tr('Request failed with HTTP %1', status)\n"_str);
+  auto result = luato::i18n::extract(sources.as_slice(), variadic_options());
+  checks.expect(result.is_ok(),
+                "variadic translation arguments should be accepted");
+  if (result.is_err())
+    return;
+  const auto value = rstd::move(result).unwrap_unchecked();
+  const auto &messages = value.messages;
+  checks.expect(messages.len() == usize(1),
+                "variadic translation should extract one message");
+  if (messages.len() == usize(1))
+    checks.expect(messages[usize()].msgid == "Request failed with HTTP %1"_str,
+                  "variadic translation should extract the literal message id");
 }
 
 void expect_errors(Checks &checks) {
@@ -170,6 +194,7 @@ void expect_merge(Checks &checks) {
 auto expect_i18n_contract() -> int {
   Checks checks;
   expect_extraction(checks);
+  expect_variadic_extraction(checks);
   expect_errors(checks);
   expect_no_execution(checks);
   expect_merge(checks);

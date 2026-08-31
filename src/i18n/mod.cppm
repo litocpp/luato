@@ -46,7 +46,7 @@ struct SourceFile {
 struct CallSpec {
   Vec<String> callee;
   usize message_argument{};
-  usize exact_argument_count{1};
+  Option<usize> maximum_argument_count{Some(usize(1))};
   String translator_comment_prefix;
   Option<String> reserved_global;
 };
