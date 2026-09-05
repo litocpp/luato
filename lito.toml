@@ -27,14 +27,7 @@ private-definitions = ["LUA_USE_LINUX"]
 exceptions = false
 rtti = false
 
-[dependencies.rstd-std]
-git = "https://github.com/litocpp/rstd.git"
-visibility = "public"
-
-[dependencies.rstd-parse]
-git = "https://github.com/litocpp/rstd.git"
-visibility = "public"
-
-[dependencies.luato-lua]
-path = "src/lua"
-visibility = "public"
+[dependencies]
+rstd-std = { version = "0.1.0", visibility = "public" }
+rstd-parse = { version = "0.1.0", visibility = "public" }
+luato-lua = { path = "src/lua", visibility = "public" }
