@@ -28,6 +28,6 @@ exceptions = false
 rtti = false
 
 [dependencies]
-rstd-std = { version = "0.1.0", visibility = "public" }
-rstd-parse = { version = "0.1.0", visibility = "public" }
-luato-lua = { path = "src/lua", visibility = "public" }
+rstd-std = { version = "0.1.0", pub = true }
+rstd-parse = { version = "0.1.0", pub = true }
+luato-lua = { path = "src/lua", pub = true }
