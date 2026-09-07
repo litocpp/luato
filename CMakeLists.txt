@@ -10,8 +10,8 @@ if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   message(FATAL_ERROR "luato currently supports Clang only")
 endif()
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT WIN32)
-  message(FATAL_ERROR "luato currently supports Linux and Windows only")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin" AND NOT WIN32)
+  message(FATAL_ERROR "luato currently supports Linux, macOS, and Windows only")
 endif()
 
 if(PROJECT_IS_TOP_LEVEL)
@@ -48,7 +48,7 @@ if(NOT TARGET rstd::rstd)
   FetchContent_Declare(
     rstd
     GIT_REPOSITORY https://github.com/litocpp/rstd.git
-    GIT_TAG c73625101b9c719517452a924fc868eee86ff982)
+    GIT_TAG 8ad75f4bbb814041092b99ae38782226409f7471)
   FetchContent_MakeAvailable(rstd)
 endif()
 
