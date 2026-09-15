@@ -308,6 +308,48 @@ void expect_script_error(Checks &checks, luato::State &state,
 
 int main() {
   Checks checks;
+  {
+    auto table = luato::Table::make();
+    checks.expect(table.scalar_entries()->is_empty(),
+                  "empty scalar collection");
+    checks.expect(table.set(String::make("first"_str), i64(7)).is_ok(),
+                  "insert integer");
+    checks.expect(
+        table.set(String::make("second"_str), String::make("value"_str))
+            .is_ok(),
+        "insert string");
+    auto copied = table.clone();
+    auto scalars = copied.scalar_entries();
+    checks.expect(scalars.is_ok() && scalars->len() == usize(2),
+                  "collect cloned scalars");
+    checks.expect((*scalars)[usize{}].key == "first"_str,
+                  "preserve scalar order");
+    checks.expect(table.set(String::make("first"_str), i64(8)).is_err(),
+                  "reject duplicate key");
+    checks.expect(
+        table.set(String::make("nested"_str), luato::Table::make()).is_ok(),
+        "insert nested table");
+    checks.expect(
+        table.set(String::make("later"_str), luato::Array::make()).is_ok(),
+        "insert later invalid scalar");
+    auto invalid = table.scalar_entries();
+    checks.expect(invalid.is_err(), "reject non-scalar field");
+    auto scalar_error = invalid.unwrap_err();
+    checks.expect(scalar_error.kind == luato::ErrorKind::Type &&
+                      scalar_error.message ==
+                          "nested must be a scalar, received table"_str,
+                  "preserve first scalar error and its path");
+    checks.expect(copied.scalar_entries()->len() == usize(2),
+                  "clone remains independent");
+    auto values = Vec<luato::Value>::make();
+    values.push(luato::Value::Table(rstd::move(copied)));
+    auto array = luato::Array::from(rstd::move(values));
+    auto cloned = array.clone();
+    checks.expect(cloned.len() == usize(1), "clone move-only array values");
+    checks.expect(
+        cloned.values()[usize{}].as_Table().value->contains("first"_str),
+        "clone nested table");
+  }
   checks.failures += expect_i18n_contract();
   int callback_drops{};
   int invocation_drops{};

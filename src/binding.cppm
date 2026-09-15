@@ -186,9 +186,9 @@ inline auto Value::Array(luato::Array value) -> Value {
 }
 
 inline auto Array::clone() const -> Array {
-  auto copied = Vec<Value>::with_capacity(values_.len());
-  for (const auto &value : values_)
-    copied.push(value.clone());
+  auto copied = values_.iter()
+                    .map([](auto value) { return value->clone(); })
+                    .collect<Vec<Value>>();
   return Array(rstd::move(copied));
 }
 
@@ -229,31 +229,28 @@ inline auto Value::clone() const -> Value {
 }
 
 inline auto Table::clone() const -> Table {
-  auto copied = Vec<TableEntry>::with_capacity(entries_.len());
-  for (const auto &entry : entries_)
-    copied.push(entry.clone());
+  auto copied = entries_.iter()
+                    .map([](auto entry) { return entry->clone(); })
+                    .collect<Vec<TableEntry>>();
   return Table(path_.clone(), rstd::move(copied));
 }
 
 inline auto Table::insert(String key, Value value) -> Result<empty> {
   if (key.is_empty())
     return Err(Error::binding(String::make("table field cannot be empty"_str)));
-  for (const auto &entry : entries_) {
-    if (entry.key == key.as_str()) {
-      return Err(Error::binding(
-          rstd::format("duplicate table field '{}'", key.as_str())));
-    }
+  if (entries_.iter().any(
+          [&](auto entry) { return entry->key == key.as_str(); })) {
+    return Err(Error::binding(
+        rstd::format("duplicate table field '{}'", key.as_str())));
   }
   entries_.push(TableEntry{rstd::move(key), rstd::move(value)});
   return Ok(empty{});
 }
 
 inline auto Table::lookup(ref<str> key) const noexcept -> const Value * {
-  for (const auto &entry : entries_) {
-    if (entry.key == key)
-      return rstd::addressof(entry.value);
-  }
-  return nullptr;
+  auto found =
+      entries_.iter().find([&](auto entry) { return entry->key == key; });
+  return found.is_some() ? rstd::addressof((*found)->value) : nullptr;
 }
 
 inline auto Table::field_path(ref<str> key) const -> String {
@@ -272,59 +269,58 @@ inline auto Table::field_type_error(ref<str> key, ref<str> expected,
 
 inline auto Table::reject_unknown_fields(slice<String> known) const
     -> Result<empty> {
-  for (const auto &entry : entries_) {
-    auto matched = false;
-    for (const auto &field : known) {
-      if (entry.key != field.as_str())
-        continue;
-      matched = true;
-      break;
-    }
+  return entries_.iter().try_for_each([&](auto borrowed) -> Result<empty> {
+    const auto &entry = *borrowed;
+    auto matched =
+        rstd::iter::into_iter(slice<String>(known)).any([&](auto field) {
+          return entry.key == field->as_str();
+        });
     if (!matched) {
       return Err(Error::make(
           ErrorKind::Binding, String::make(),
           rstd::format("unknown field {}", field_path(entry.key).as_str())));
     }
-  }
-  return Ok(empty{});
+    return Ok(empty{});
+  });
 }
 
 inline auto Table::scalar_entries() const -> Result<Vec<ScalarEntry>> {
-  auto result = Vec<ScalarEntry>::with_capacity(entries_.len());
-  for (const auto &entry : entries_) {
-    auto path = field_path(entry.key);
-    switch (entry.value.tag()) {
-    case Value::Tag::Integer:
-      result.push(
-          ScalarEntry{entry.key.clone(), rstd::move(path),
-                      ScalarValue::Integer(entry.value.as_Integer().value)});
-      break;
-    case Value::Tag::Boolean:
-      result.push(
-          ScalarEntry{entry.key.clone(), rstd::move(path),
-                      ScalarValue::Boolean(entry.value.as_Boolean().value)});
-      break;
-    case Value::Tag::String:
-      result.push(ScalarEntry{
-          entry.key.clone(), rstd::move(path),
-          ScalarValue::String(entry.value.as_String().value.clone())});
-      break;
-    case Value::Tag::Opaque:
-      return Err(Error::make(
-          ErrorKind::Type, String::make(),
-          rstd::format("{} must be a scalar, received opaque handle",
-                       path.as_str())));
-    case Value::Tag::Table:
-      return Err(Error::make(
-          ErrorKind::Type, String::make(),
-          rstd::format("{} must be a scalar, received table", path.as_str())));
-    case Value::Tag::Array:
-      return Err(Error::make(
-          ErrorKind::Type, String::make(),
-          rstd::format("{} must be a scalar, received array", path.as_str())));
-    }
-  }
-  return Ok(rstd::move(result));
+  return entries_.iter()
+      .map([&](auto borrowed) -> Result<ScalarEntry> {
+        const auto &entry = *borrowed;
+        auto path = field_path(entry.key);
+        switch (entry.value.tag()) {
+        case Value::Tag::Integer:
+          return Ok(ScalarEntry{
+              entry.key.clone(), rstd::move(path),
+              ScalarValue::Integer(entry.value.as_Integer().value)});
+        case Value::Tag::Boolean:
+          return Ok(ScalarEntry{
+              entry.key.clone(), rstd::move(path),
+              ScalarValue::Boolean(entry.value.as_Boolean().value)});
+        case Value::Tag::String:
+          return Ok(ScalarEntry{
+              entry.key.clone(), rstd::move(path),
+              ScalarValue::String(entry.value.as_String().value.clone())});
+        case Value::Tag::Opaque:
+          return Err(Error::make(
+              ErrorKind::Type, String::make(),
+              rstd::format("{} must be a scalar, received opaque handle",
+                           path.as_str())));
+        case Value::Tag::Table:
+          return Err(
+              Error::make(ErrorKind::Type, String::make(),
+                          rstd::format("{} must be a scalar, received table",
+                                       path.as_str())));
+        case Value::Tag::Array:
+          return Err(
+              Error::make(ErrorKind::Type, String::make(),
+                          rstd::format("{} must be a scalar, received array",
+                                       path.as_str())));
+        }
+        rstd::panic{"invalid Luato value tag"};
+      })
+      .collect<Result<Vec<ScalarEntry>>>();
 }
 
 class CallFrame {
