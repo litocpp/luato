@@ -117,6 +117,7 @@ struct NativeRequireModule {
 
 struct StateStorage {
   lua_State *lua;
+  bool executing{};
   Vec<Box<CallbackSlot>> callbacks;
   Vec<String> modules;
   Vec<NativeRequireModule> native_require_modules;
@@ -138,6 +139,18 @@ struct StateStorage {
       lua_close(lua);
   }
 };
+
+struct ExecutionGuard {
+  StateStorage &storage;
+  explicit ExecutionGuard(StateStorage &value) : storage(value) {
+    storage.executing = true;
+  }
+  ~ExecutionGuard() { storage.executing = false; }
+};
+
+auto reentrant_state_error() -> Error {
+  return Error::binding(String::make("Lua state is already executing"_str));
+}
 
 struct Invocation {
   lua_State *lua;
@@ -1145,6 +1158,8 @@ auto State::register_native_require_module(
   if (storage_ == nullptr)
     return Err(moved_state_error());
   auto *storage = static_cast<StateStorage *>(storage_);
+  if (storage->executing)
+    return Err(reentrant_state_error());
   if (specification.require_name_.is_empty()) {
     return Err(Error::make(
         ErrorKind::Binding, String::make(),
@@ -1201,6 +1216,8 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
   if (storage_ == nullptr)
     return Err(moved_state_error());
   auto *storage = static_cast<StateStorage *>(storage_);
+  if (storage->executing)
+    return Err(reentrant_state_error());
   auto *lua = storage->lua;
   auto old_top = lua_gettop(lua);
 
@@ -1309,6 +1326,8 @@ auto State::set_module_resolver(ModuleResolverSpec resolver) -> Result<empty> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
   auto *storage = static_cast<StateStorage *>(storage_);
+  if (storage->executing)
+    return Err(reentrant_state_error());
   if (storage->module_resolver.is_some()) {
     return Err(Error::make(
         ErrorKind::Module, String::make(),
@@ -1409,6 +1428,9 @@ auto State::execute_entry(LuaModuleSource source) -> Result<ExecutionReport> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
   auto *storage = static_cast<StateStorage *>(storage_);
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  auto execution = ExecutionGuard(*storage);
   auto *lua = storage->lua;
   auto old_top = lua_gettop(lua);
   if (source.logical_name.is_empty()) {
@@ -1483,6 +1505,9 @@ auto State::execute_file(ref<rstd::path::Path> path)
   if (storage_ == nullptr)
     return Err(moved_state_error());
   auto *storage = static_cast<StateStorage *>(storage_);
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  auto execution = ExecutionGuard(*storage);
   auto *lua = storage->lua;
   auto old_top = lua_gettop(lua);
   auto source = path.to_string_lossy();

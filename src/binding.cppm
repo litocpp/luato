@@ -404,10 +404,144 @@ private:
 
 using NativeCallback = dyn<FnMut<BindingResult(CallFrame &)>>;
 
+} // namespace luato
+
+namespace luato {
+
+template <typename T>
+concept NativeValue =
+    rstd::mtp::any<T, i64, bool, String, Table, Array, OpaqueHandle>;
+
+template <typename T> struct NativeReturn {
+  static constexpr bool supported =
+      NativeValue<T> || rstd::mtp::same_as<T, empty>;
+  static auto push(CallFrame &frame, T value) -> BindingResult
+    requires supported
+  {
+    if constexpr (rstd::mtp::same_as<T, empty>)
+      return Ok(usize{});
+    else if constexpr (rstd::mtp::same_as<T, Array>)
+      frame.push(Value::Array(rstd::move(value)));
+    else
+      frame.push(rstd::move(value));
+    return Ok(usize(1));
+  }
+};
+
+template <> struct NativeReturn<void> {
+  static constexpr bool supported = true;
+};
+
+template <typename T> struct NativeReturn<Option<T>> {
+  static constexpr bool supported = NativeValue<T>;
+  static auto push(CallFrame &frame, Option<T> value) -> BindingResult
+    requires supported
+  {
+    if (value.is_some())
+      return NativeReturn<T>::push(frame, rstd::move(*value));
+    frame.push_nil();
+    return Ok(usize(1));
+  }
+};
+
+template <typename T> struct NativeReturn<Result<T>> {
+  static constexpr bool supported =
+      NativeReturn<T>::supported && !rstd::mtp::is_void<T>;
+  static auto push(CallFrame &frame, Result<T> value) -> BindingResult
+    requires supported
+  {
+    if (value.is_err())
+      return Err(rstd::move(value).unwrap_err());
+    return NativeReturn<T>::push(frame, rstd::move(value).unwrap());
+  }
+};
+
+template <typename Signature> struct NativeAdapter {};
+
+template <typename R, typename... Args> struct NativeAdapter<R(Args...)> {
+  static constexpr bool supported =
+      NativeReturn<R>::supported &&
+      ((NativeValue<rstd::mtp::rm_cvf<Args>> &&
+        (!rstd::mtp::is_ref<Args> ||
+         rstd::mtp::same_as<Args, const rstd::mtp::rm_cvf<Args> &>)) &&
+       ...);
+  using Arguments = rstd::tuple<Option<rstd::mtp::rm_cvf<Args>>...>;
+
+  template <rstd::size_t I = 0>
+  static auto read(CallFrame &frame, Arguments &arguments) -> Result<empty> {
+    if constexpr (I == sizeof...(Args))
+      return Ok(empty{});
+    else {
+      using T = rstd::mtp::rm_cvf<
+          typename rstd::mtp::func_traits<R(Args...)>::template argument<I>>;
+      auto value = frame.required<T>(usize(I));
+      if (value.is_err())
+        return Err(rstd::move(value).unwrap_err());
+      rstd::get<I>(arguments) = Some(rstd::move(value).unwrap());
+      return read<I + 1>(frame, arguments);
+    }
+  }
+
+  template <typename F, rstd::size_t... Is>
+  static auto call(F &function, CallFrame &frame, Arguments &arguments,
+                   rstd::mtp::index_sequence<Is...>) -> BindingResult {
+    if constexpr (rstd::mtp::is_void<R>) {
+      function(static_cast<Args>(rstd::move(*rstd::get<Is>(arguments)))...);
+      return Ok(usize{});
+    } else {
+      return NativeReturn<R>::push(frame, function(static_cast<Args>(rstd::move(
+                                              *rstd::get<Is>(arguments)))...));
+    }
+  }
+
+  template <typename F>
+  static constexpr bool accepts =
+      supported && requires(F &function, Args... args) {
+        { function(rstd::forward<Args>(args)...) } -> rstd::mtp::same_as<R>;
+      };
+
+  template <typename F> static auto wrap(F &&function) {
+    return [function = rstd::forward<F>(function)](
+               CallFrame &frame) mutable -> BindingResult {
+      auto arguments = Arguments{};
+      auto loaded = read(frame, arguments);
+      if (loaded.is_err())
+        return Err(rstd::move(loaded).unwrap_err());
+      return call(function, frame, arguments,
+                  rstd::mtp::make_index_sequence<sizeof...(Args)>{});
+    };
+  }
+};
+
+} // namespace luato
+
+export namespace luato {
+
 class NativeFunctionSpec {
 public:
   NativeFunctionSpec(NativeFunctionSpec &&) noexcept = default;
   NativeFunctionSpec &operator=(NativeFunctionSpec &&) noexcept = default;
+
+  /// Owns the callable; borrowed captures must outlive the State.
+  /// Arguments are decoded in order and only owned values are returned to Lua.
+  template <typename Signature, typename F>
+    requires NativeAdapter<Signature>::template
+  accepts<rstd::mtp::decay<F>> static auto typed(String name, F &&function)
+      -> NativeFunctionSpec {
+    return make(rstd::move(name),
+                usize(rstd::mtp::func_traits<Signature>::arity),
+                NativeAdapter<Signature>::wrap(rstd::forward<F>(function)));
+  }
+
+  template <typename F>
+    requires requires {
+      typename rstd::mtp::func_traits<F>::signature;
+    } && NativeAdapter<typename rstd::mtp::func_traits<F>::signature>::template
+  accepts<rstd::mtp::decay<F>> static auto typed(String name, F &&function)
+      -> NativeFunctionSpec {
+    return typed<typename rstd::mtp::func_traits<F>::signature>(
+        rstd::move(name), rstd::forward<F>(function));
+  }
 
   template <typename Callback>
   static auto make(String name, usize arity, Callback &&callback)
@@ -440,6 +574,25 @@ public:
 
   void add(NativeFunctionSpec function) {
     functions_.push(rstd::move(function));
+  }
+
+  template <typename F>
+    requires requires(String name, F &&f) {
+      NativeFunctionSpec::typed(rstd::move(name), rstd::forward<F>(f));
+    }
+  void function(String name, F &&callable) {
+    add(NativeFunctionSpec::typed(rstd::move(name),
+                                  rstd::forward<F>(callable)));
+  }
+
+  template <typename Signature, typename F>
+    requires requires(String name, F &&f) {
+      NativeFunctionSpec::typed<Signature>(rstd::move(name),
+                                           rstd::forward<F>(f));
+    }
+  void function(String name, F &&callable) {
+    add(NativeFunctionSpec::typed<Signature>(rstd::move(name),
+                                             rstd::forward<F>(callable)));
   }
   void set(String name, i64 value) {
     fields_.push(TableEntry{rstd::move(name), Value::Integer(value)});

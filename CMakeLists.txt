@@ -58,7 +58,7 @@ add_subdirectory(src)
 if(LUATO_BUILD_TESTS)
   enable_testing()
 
-  add_executable(luato.contract tests/main.cpp tests/i18n.cpp)
+  add_executable(luato.contract tests/main.cpp tests/i18n.cpp tests/typed.cpp)
   target_compile_features(luato.contract PRIVATE cxx_std_20)
   if(NOT luato_IS_TOP_LEVEL)
     target_compile_options(
