@@ -237,7 +237,7 @@ inline auto Table::clone() const -> Table {
 
 inline auto Table::insert(String key, Value value) -> Result<empty> {
   if (key.is_empty())
-    return Err(Error::binding(String::make("table field cannot be empty"_str)));
+    return Err(Error::binding("table field cannot be empty"_Str));
   if (entries_.iter().any(
           [&](auto entry) { return entry->key == key.as_str(); })) {
     return Err(Error::binding(

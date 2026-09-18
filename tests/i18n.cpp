@@ -20,10 +20,10 @@ struct Checks {
 
 auto options() -> luato::i18n::ExtractionOptions {
   auto callee = Vec<String>::make();
-  callee.push(String::make("tr"_str));
-  return luato::i18n::ExtractionOptions{luato::i18n::CallSpec{
-      rstd::move(callee), usize(), Some(usize(1)),
-      String::make("TRANSLATORS:"_str), Some(String::make("tr"_str))}};
+  callee.push("tr"_Str);
+  return luato::i18n::ExtractionOptions{
+      luato::i18n::CallSpec{rstd::move(callee), usize(), Some(usize(1)),
+                            "TRANSLATORS:"_Str, Some("tr"_Str)}};
 }
 
 auto variadic_options() -> luato::i18n::ExtractionOptions {

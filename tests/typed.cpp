@@ -29,8 +29,8 @@ struct TypedCapture {
 };
 
 auto typed_source(ref<str> text) -> luato::LuaModuleSource {
-  return {String::make("typed"_str), String::make("typed:v1"_str),
-          String::make("typed.lua"_str), Vec<u8>::from(text.as_bytes())};
+  return {"typed"_Str, "typed:v1"_Str, "typed.lua"_Str,
+          Vec<u8>::from(text.as_bytes())};
 }
 
 auto expect_typed_contract() -> int {
@@ -49,49 +49,42 @@ auto expect_typed_contract() -> int {
   {
     auto state =
         luato::State::create(luato::StateOptions::build_script()).unwrap();
-    auto host = luato::ModuleSpec(String::make("typed"_str));
-    host.function(String::make("add"_str), &typed_add);
-    host.function(String::make("echo"_str), [](String value) { return value; });
-    host.function(String::make("borrow"_str),
+    auto host = luato::ModuleSpec("typed"_Str);
+    host.function("add"_Str, &typed_add);
+    host.function("echo"_Str, [](String value) { return value; });
+    host.function("borrow"_Str,
                   [](const String &value) { return value.clone(); });
-    host.function(String::make("table"_str),
-                  [](luato::Table value) { return value; });
-    host.function(String::make("array"_str),
-                  [](luato::Array value) { return value; });
-    host.function(String::make("none"_str),
-                  []() -> Option<String> { return None(); });
-    host.function(String::make("some"_str),
-                  []() -> luato::Result<Option<String>> {
-                    return Ok(Some(String::make("value"_str)));
-                  });
-    host.function(String::make("empty"_str),
+    host.function("table"_Str, [](luato::Table value) { return value; });
+    host.function("array"_Str, [](luato::Array value) { return value; });
+    host.function("none"_Str, []() -> Option<String> { return None(); });
+    host.function("some"_Str, []() -> luato::Result<Option<String>> {
+      return Ok(Some("value"_Str));
+    });
+    host.function("empty"_Str,
                   []() -> luato::Result<empty> { return Ok(empty{}); });
-    host.function(String::make("void"_str), [] {});
+    host.function("void"_Str, [] {});
     auto identity = i64(42);
-    host.function(String::make("handle"_str),
+    host.function("handle"_Str,
                   [&identity]() { return luato::OpaqueHandle{&identity}; });
-    host.function(String::make("consume"_str),
+    host.function("consume"_Str,
                   [&identity](luato::OpaqueHandle value, bool enabled) {
                     return enabled && value.identity == &identity;
                   });
-    host.function(String::make("next"_str),
+    host.function("next"_Str,
                   [capture = TypedCapture(drops), count = i64{}]() mutable {
                     count += i64(1);
                     return count;
                   });
-    host.function<i64(i64)>(String::make("generic"_str),
-                            [](auto value) { return value; });
-    host.function(
-        String::make("fail"_str),
-        [&calls](String, bool) -> luato::Result<String> {
-          ++calls;
-          return Err(luato::Error::binding(String::make("typed failure"_str)));
-        });
-    host.function(String::make("reenter"_str), [&state]() -> bool {
+    host.function<i64(i64)>("generic"_Str, [](auto value) { return value; });
+    host.function("fail"_Str, [&calls](String, bool) -> luato::Result<String> {
+      ++calls;
+      return Err(luato::Error::binding("typed failure"_Str));
+    });
+    host.function("reenter"_Str, [&state]() -> bool {
       auto nested =
           state.execute_entry(typed_source("error('should not run')"_str));
       auto registration =
-          state.register_module(luato::ModuleSpec(String::make("nested"_str)));
+          state.register_module(luato::ModuleSpec("nested"_Str));
       auto file = state.execute_file(
           rstd::path::PathBuf::from("missing-reentrant-script.lua"_str)
               .as_path());
@@ -101,8 +94,8 @@ auto expect_typed_contract() -> int {
              file.unwrap_err().kind == luato::ErrorKind::Binding;
     });
     check(state.register_module(rstd::move(host)).is_ok());
-    auto duplicate = luato::ModuleSpec(String::make("typed"_str));
-    duplicate.function(String::make("capture"_str),
+    auto duplicate = luato::ModuleSpec("typed"_Str);
+    duplicate.function("capture"_Str,
                        [capture = TypedCapture(rejected_drops)] {});
     check(state.register_module(rstd::move(duplicate)).is_err());
     check(rejected_drops == 1);

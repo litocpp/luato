@@ -98,7 +98,7 @@ void expect_module_loader(Checks &checks) {
           -> luato::Result<luato::LuaModuleSource> {
         return Err(luato::Error::make(luato::ErrorKind::Module,
                                       rstd::move(request.importer_path),
-                                      String::make("unused"_str)));
+                                      "unused"_Str));
       }));
   checks.expect(duplicate.is_err(), "module resolver should configure once");
 
@@ -173,9 +173,9 @@ void expect_module_loader(Checks &checks) {
                                    "cycle/b.lua"_str,
                                    "return require('./a')\n"_str));
             }
-            return Err(luato::Error::make(
-                luato::ErrorKind::Module, rstd::move(request.importer_path),
-                String::make("cycle module was not found"_str)));
+            return Err(luato::Error::make(luato::ErrorKind::Module,
+                                          rstd::move(request.importer_path),
+                                          "cycle module was not found"_Str));
           }));
   checks.expect(cycle_resolver.is_ok(), "cycle resolver should configure");
   auto cycle = cycle_state.execute_entry(
@@ -199,12 +199,11 @@ void expect_native_require_module(Checks &checks) {
     return;
   auto state = rstd::move(created).unwrap_unchecked();
 
-  auto host = luato::ModuleSpec(String::make("lito"_str));
-  host.set(String::make("api"_str), String::make("test"_str));
+  auto host = luato::ModuleSpec("lito"_Str);
+  host.set("api"_Str, "test"_Str);
   auto specification = luato::NativeRequireModuleSpec(
-      String::make("@lito"_str), String::make("host:lito:test"_str),
-      rstd::move(host));
-  specification.set_global_alias(String::make("lito"_str));
+      "@lito"_Str, "host:lito:test"_Str, rstd::move(host));
+  specification.set_global_alias("lito"_Str);
   auto registered =
       state.register_native_require_module(rstd::move(specification));
   checks.expect(registered.is_ok(), "native require module should register");
@@ -242,20 +241,17 @@ void expect_native_require_module(Checks &checks) {
                   "native require report should preserve the API identity");
   }
 
-  auto duplicate_name_module = luato::ModuleSpec(String::make("other"_str));
+  auto duplicate_name_module = luato::ModuleSpec("other"_Str);
   auto duplicate_name =
       state.register_native_require_module(luato::NativeRequireModuleSpec(
-          String::make("@lito"_str), String::make("host:other"_str),
-          rstd::move(duplicate_name_module)));
+          "@lito"_Str, "host:other"_Str, rstd::move(duplicate_name_module)));
   checks.expect(duplicate_name.is_err(),
                 "duplicate native require names should be rejected");
 
-  auto duplicate_identity_module =
-      luato::ModuleSpec(String::make("another"_str));
-  auto duplicate_identity =
-      state.register_native_require_module(luato::NativeRequireModuleSpec(
-          String::make("@another"_str), String::make("host:lito:test"_str),
-          rstd::move(duplicate_identity_module)));
+  auto duplicate_identity_module = luato::ModuleSpec("another"_Str);
+  auto duplicate_identity = state.register_native_require_module(
+      luato::NativeRequireModuleSpec("@another"_Str, "host:lito:test"_Str,
+                                     rstd::move(duplicate_identity_module)));
   checks.expect(duplicate_identity.is_err(),
                 "duplicate native require identities should be rejected");
 
@@ -313,26 +309,21 @@ int main() {
     auto table = luato::Table::make();
     checks.expect(table.scalar_entries()->is_empty(),
                   "empty scalar collection");
-    checks.expect(table.set(String::make("first"_str), i64(7)).is_ok(),
-                  "insert integer");
-    checks.expect(
-        table.set(String::make("second"_str), String::make("value"_str))
-            .is_ok(),
-        "insert string");
+    checks.expect(table.set("first"_Str, i64(7)).is_ok(), "insert integer");
+    checks.expect(table.set("second"_Str, "value"_Str).is_ok(),
+                  "insert string");
     auto copied = table.clone();
     auto scalars = copied.scalar_entries();
     checks.expect(scalars.is_ok() && scalars->len() == usize(2),
                   "collect cloned scalars");
     checks.expect((*scalars)[usize{}].key == "first"_str,
                   "preserve scalar order");
-    checks.expect(table.set(String::make("first"_str), i64(8)).is_err(),
+    checks.expect(table.set("first"_Str, i64(8)).is_err(),
                   "reject duplicate key");
-    checks.expect(
-        table.set(String::make("nested"_str), luato::Table::make()).is_ok(),
-        "insert nested table");
-    checks.expect(
-        table.set(String::make("later"_str), luato::Array::make()).is_ok(),
-        "insert later invalid scalar");
+    checks.expect(table.set("nested"_Str, luato::Table::make()).is_ok(),
+                  "insert nested table");
+    checks.expect(table.set("later"_Str, luato::Array::make()).is_ok(),
+                  "insert later invalid scalar");
     auto invalid = table.scalar_entries();
     checks.expect(invalid.is_err(), "reject non-scalar field");
     auto scalar_error = invalid.unwrap_err();
@@ -403,11 +394,11 @@ int main() {
                     "moved-from state should report its invariant error");
     }
 
-    auto host = luato::ModuleSpec(String::make("host"_str));
+    auto host = luato::ModuleSpec("host"_Str);
     auto opaque_identity = i32(42);
-    host.set(String::make("profile"_str), String::make("debug"_str));
+    host.set("profile"_Str, "debug"_Str);
     host.add(luato::NativeFunctionSpec::make(
-        String::make("handle"_str), usize{},
+        "handle"_Str, usize{},
         [&opaque_identity](luato::CallFrame &frame) -> luato::BindingResult {
           frame.push(luato::OpaqueHandle{
               .identity =
@@ -416,7 +407,7 @@ int main() {
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("consume"_str), usize(1),
+        "consume"_Str, usize(1),
         [&opaque_identity](luato::CallFrame &frame) -> luato::BindingResult {
           auto handle = frame.required<luato::OpaqueHandle>(usize{});
           if (handle.is_err())
@@ -426,7 +417,7 @@ int main() {
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("consume_table"_str), usize(1),
+        "consume_table"_Str, usize(1),
         [&opaque_identity](luato::CallFrame &frame) -> luato::BindingResult {
           auto request = frame.required<luato::Table>(usize{});
           if (request.is_err())
@@ -439,7 +430,7 @@ int main() {
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("add"_str), usize(2),
+        "add"_Str, usize(2),
         [lifetime = DropProbe(callback_drops)](
             luato::CallFrame &frame) mutable -> luato::BindingResult {
           auto lhs = frame.required<i64>(usize{});
@@ -456,7 +447,7 @@ int main() {
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("echo"_str), usize(1),
+        "echo"_Str, usize(1),
         [](luato::CallFrame &frame) -> luato::BindingResult {
           auto value = frame.required<String>(usize{});
           if (value.is_err()) {
@@ -466,19 +457,19 @@ int main() {
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("truth"_str), usize{},
+        "truth"_Str, usize{},
         [](luato::CallFrame &frame) -> luato::BindingResult {
           frame.push(true);
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("nothing"_str), usize{},
+        "nothing"_Str, usize{},
         [](luato::CallFrame &frame) -> luato::BindingResult {
           frame.push_nil();
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("invert"_str), usize(1),
+        "invert"_Str, usize(1),
         [](luato::CallFrame &frame) -> luato::BindingResult {
           auto value = frame.required<bool>(usize{});
           if (value.is_err())
@@ -487,7 +478,7 @@ int main() {
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("configure"_str), usize(1),
+        "configure"_Str, usize(1),
         [](luato::CallFrame &frame) -> luato::BindingResult {
           auto request = frame.required<luato::Table>(usize{});
           if (request.is_err())
@@ -495,9 +486,9 @@ int main() {
           auto table = rstd::move(request).unwrap_unchecked();
 
           auto known = Vec<String>::make();
-          known.push(String::make("package"_str));
-          known.push(String::make("enabled"_str));
-          known.push(String::make("values"_str));
+          known.push("package"_Str);
+          known.push("enabled"_Str);
+          known.push("values"_Str);
           auto checked = table.reject_unknown_fields(known.as_slice());
           if (checked.is_err())
             return Err(rstd::move(checked).unwrap_err_unchecked());
@@ -516,37 +507,37 @@ int main() {
             return Err(rstd::move(scalars).unwrap_err_unchecked());
           if (scalars->len() != usize(3)) {
             return Err(luato::Error::binding(
-                String::make("values should contain three scalar fields"_str)));
+                "values should contain three scalar fields"_Str));
           }
 
           auto result = luato::Table::make();
-          auto inserted = result.set(String::make("output"_str),
-                                     rstd::move(package).unwrap_unchecked());
+          auto inserted =
+              result.set("output"_Str, rstd::move(package).unwrap_unchecked());
           if (inserted.is_err())
             return Err(rstd::move(inserted).unwrap_err_unchecked());
-          inserted = result.set(String::make("changed"_str),
-                                rstd::move(enabled).unwrap_unchecked());
+          inserted =
+              result.set("changed"_Str, rstd::move(enabled).unwrap_unchecked());
           if (inserted.is_err())
             return Err(rstd::move(inserted).unwrap_err_unchecked());
           frame.push(rstd::move(result));
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("collect"_str), usize(1),
+        "collect"_Str, usize(1),
         [](luato::CallFrame &frame) -> luato::BindingResult {
           auto input = frame.required<luato::Array>(usize{});
           if (input.is_err())
             return Err(rstd::move(input).unwrap_err_unchecked());
           auto values = rstd::move(input).unwrap_unchecked();
           if (values.len() != usize(2)) {
-            return Err(luato::Error::binding(
-                String::make("collect expects two entries"_str)));
+            return Err(
+                luato::Error::binding("collect expects two entries"_Str));
           }
           auto total = i64{};
           for (const auto &value : values.values()) {
             if (!value.is_Table()) {
-              return Err(luato::Error::binding(
-                  String::make("collect entries must be tables"_str)));
+              return Err(
+                  luato::Error::binding("collect entries must be tables"_Str));
             }
             auto amount = value.as_Table().value->required<i64>("amount"_str);
             if (amount.is_err())
@@ -557,7 +548,7 @@ int main() {
           return Ok(usize(1));
         }));
     host.add(luato::NativeFunctionSpec::make(
-        String::make("fail"_str), usize(1),
+        "fail"_Str, usize(1),
         [lifetime = DropProbe(callback_drops), &invocation_drops](
             luato::CallFrame &frame) mutable -> luato::BindingResult {
           auto invocation = DropProbe(invocation_drops);
@@ -575,9 +566,9 @@ int main() {
     if (registration.is_err())
       return 1;
 
-    auto duplicate = luato::ModuleSpec(String::make("host"_str));
+    auto duplicate = luato::ModuleSpec("host"_Str);
     duplicate.add(luato::NativeFunctionSpec::make(
-        String::make("unused"_str), usize{},
+        "unused"_Str, usize{},
         [lifetime = DropProbe(rejected_callback_drops)](
             luato::CallFrame &) mutable -> luato::BindingResult {
           return Ok(usize{});
