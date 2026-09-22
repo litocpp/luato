@@ -388,9 +388,8 @@ auto module_stack_chain(const StateStorage &storage, ref<str> requested)
 auto module_error(StateStorage &storage, Error error, ref<str> requested)
     -> Error {
   if (error.source.is_empty()) {
-    if (!storage.module_stack.is_empty()) {
-      error.source = storage.module_stack[storage.module_stack.len() - usize(1)]
-                         .display_path.clone();
+    if (auto last = storage.module_stack.last(); last.is_some()) {
+      error.source = last->get().display_path.clone();
     } else {
       error.source = String::make(requested);
     }
@@ -482,11 +481,9 @@ auto load_module(StateStorage &storage, lua_State *state, ref<str> requested)
 
   auto importer_identity = String::make();
   auto importer_path = String::make();
-  if (!storage.module_stack.is_empty()) {
-    const auto &importer =
-        storage.module_stack[storage.module_stack.len() - usize(1)];
-    importer_identity = importer.identity.clone();
-    importer_path = importer.display_path.clone();
+  if (auto importer = storage.module_stack.last(); importer.is_some()) {
+    importer_identity = importer->get().identity.clone();
+    importer_path = importer->get().display_path.clone();
   }
 
   auto resolved = (*storage.module_resolver)
