@@ -47,6 +47,149 @@ auto expect_typed_contract() -> int {
   int rejected_drops = 0;
   int calls = 0;
   {
+    auto first =
+        luato::State::create(luato::StateOptions::build_script()).unwrap();
+    auto second =
+        luato::State::create(luato::StateOptions::build_script()).unwrap();
+    auto first_initial = first.used_memory().unwrap();
+    auto second_initial = second.used_memory().unwrap();
+    check(first.set_memory_limit(first_initial + usize(8192)).unwrap() ==
+          usize());
+    check(first
+              .execute_entry(
+                  typed_source("local s = string.rep('x', 1048576)"_str))
+              .is_err());
+    check(second
+              .execute_entry(
+                  typed_source("payload = string.rep('x', 1048576)"_str))
+              .is_ok());
+    check(second.used_memory().unwrap() > second_initial + usize(1048576));
+    check(first.set_memory_limit(usize()).unwrap() ==
+          first_initial + usize(8192));
+    check(first.execute_entry(typed_source("return 42"_str)).is_ok());
+  }
+  {
+    auto state =
+        luato::State::create(luato::StateOptions::build_script()).unwrap();
+    auto initial = state.used_memory().unwrap();
+    check(initial > usize());
+    check(state.set_memory_limit(initial + usize(8192)).unwrap() == usize());
+    auto failure = state.execute_entry(
+        typed_source("local s = string.rep('x', 1048576)"_str));
+    check(failure.is_err());
+    if (failure.is_err())
+      check(failure.unwrap_err().kind == luato::ErrorKind::Memory);
+    check(state.used_memory().unwrap() <= initial + usize(8192));
+    check(state.set_memory_limit(usize()).unwrap() == initial + usize(8192));
+    check(state
+              .execute_entry(
+                  typed_source("local s = string.rep('x', 1048576)"_str))
+              .is_ok());
+    auto moved = rstd::move(state);
+    check(state.used_memory().is_err() &&
+          state.set_memory_limit(usize()).is_err());
+    check(moved.used_memory().unwrap() > usize());
+  }
+  {
+    auto state =
+        luato::State::create(luato::StateOptions::build_script()).unwrap();
+    auto initial = state.used_memory().unwrap();
+    check(state
+              .execute_entry(
+                  typed_source("payload = string.rep('x', 1048576)"_str))
+              .is_ok());
+    auto peak = state.used_memory().unwrap();
+    check(peak > initial + usize(1048576));
+    check(state
+              .execute_entry(
+                  typed_source("payload = nil; collectgarbage('collect')"_str))
+              .is_ok());
+    check(state.used_memory().unwrap() < peak - usize(1048576));
+    check(state.set_memory_limit(usize(1)).unwrap() == usize());
+    check(state.set_memory_limit(usize()).unwrap() == usize(1));
+    check(state.execute_entry(typed_source("return 42"_str)).is_ok());
+  }
+  {
+    auto options = luato::StateOptions::base().with_instruction_limit(u64(1));
+    check(!options.text_only() && options.instruction_limit() == u64(1));
+    auto state = luato::State::create(options).unwrap();
+    auto result = state.execute_entry(typed_source("return 1"_str));
+    check(result.is_err() && result.unwrap_err().message.as_str().contains(
+                                 "instruction limit"_str));
+    auto again = state.execute_entry(typed_source("return 1"_str));
+    check(again.is_err());
+    auto unlimited =
+        luato::State::create(options.with_instruction_limit(u64())).unwrap();
+    check(unlimited.execute_entry(typed_source("return 1"_str)).is_ok());
+  }
+  {
+    auto options =
+        luato::StateOptions::base().with_text_only().with_instruction_limit(
+            u64(10000));
+    check(options.text_only() && !options.is_restricted() &&
+          options.instruction_limit() == u64(10000));
+    auto state = luato::State::create(options).unwrap();
+    state
+        .set_module_resolver(luato::ModuleResolverSpec::make(
+            [](luato::ModuleRequest) -> luato::Result<luato::LuaModuleSource> {
+              return Ok(typed_source(
+                  "return {none=function() end, values=function() return nil, 1.5, 7 end, failure=function() error('failure') end}"_str));
+            }))
+        .unwrap();
+    auto empty =
+        state.call_module_multi("multi"_str, "none"_str, luato::Array::make());
+    check(empty.is_ok() && empty->len() == usize());
+    auto values = state.call_module_multi("multi"_str, "values"_str,
+                                          luato::Array::make());
+    check(values.is_ok() && values->len() == usize(3));
+    if (values.is_ok() && values->len() == usize(3)) {
+      auto items = values->values();
+      check(items[usize()].is_Nil());
+      check(items[usize(1)].is_Number() &&
+            items[usize(1)].as_Number().value == f64(1.5));
+      check(items[usize(2)].is_Integer() &&
+            items[usize(2)].as_Integer().value == i64(7));
+    }
+    check(
+        state
+            .call_module_multi("multi"_str, "failure"_str, luato::Array::make())
+            .is_err());
+    check(state.call_module_multi("multi"_str, "none"_str, luato::Array::make())
+              .is_ok());
+  }
+  {
+    auto state =
+        luato::State::create(luato::StateOptions::restricted(u64(10000)))
+            .unwrap();
+    state
+        .set_module_resolver(luato::ModuleResolverSpec::make(
+            [](luato::ModuleRequest) -> luato::Result<luato::LuaModuleSource> {
+              return Ok(typed_source(
+                  "return {probe=function(item) assert(io==nil and os==nil and loadfile==nil and dofile==nil and load==nil and print==nil); return {width=item.width, value=1.5} end, loop=function() while true do end end, empty=function() return nil end, fail=function() error('test error') end}"_str));
+            }))
+        .unwrap();
+    auto item = luato::Table::make();
+    item.set("width"_Str, i64(1920)).unwrap();
+    auto arguments = Vec<luato::Value>::make();
+    arguments.push(luato::Value::Table(rstd::move(item)));
+    auto result = state.call_module("test"_str, "probe"_str,
+                                    luato::Array::from(rstd::move(arguments)));
+    check(result.is_ok() && result->is_some() && (**result).is_Table());
+    if (result.is_ok() && result->is_some())
+      check((**result).as_Table().value->required<i64>("width"_str).unwrap() ==
+            i64(1920));
+    check(state.call_module("test"_str, "empty"_str, luato::Array::make())
+              .unwrap()
+              .is_none());
+    check(state.call_module("test"_str, "fail"_str, luato::Array::make())
+              .is_err());
+    auto loop = state.call_module("test"_str, "loop"_str, luato::Array::make());
+    check(loop.is_err() &&
+          loop.unwrap_err().message.as_str().contains("instruction limit"_str));
+    check(state.call_module("test"_str, "empty"_str, luato::Array::make())
+              .is_ok());
+  }
+  {
     auto state =
         luato::State::create(luato::StateOptions::build_script()).unwrap();
     auto host = luato::ModuleSpec("typed"_Str);

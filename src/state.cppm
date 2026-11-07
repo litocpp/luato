@@ -1,3 +1,5 @@
+module;
+#include <stddef.h>
 export module luato:state;
 
 export import :binding;
@@ -17,6 +19,28 @@ enum class StandardLibrary {
 };
 
 struct StateOptions {
+  static constexpr auto restricted(u64 instructions = u64(1000000)) noexcept
+      -> StateOptions {
+    return StateOptions(true, true, true, true, instructions);
+  }
+  constexpr auto is_restricted() const noexcept -> bool { return restricted_; }
+  constexpr auto instruction_limit() const noexcept -> u64 {
+    return instructions_;
+  }
+  constexpr auto with_text_only(bool enabled = true) const noexcept
+      -> StateOptions {
+    auto result = *this;
+    result.text_only_ = enabled;
+    return result;
+  }
+  // The hook provides a cooperative limit, not isolation from untrusted code.
+  constexpr auto with_instruction_limit(u64 limit) const noexcept
+      -> StateOptions {
+    auto result = *this;
+    result.instructions_ = limit;
+    return result;
+  }
+  constexpr auto text_only() const noexcept -> bool { return text_only_; }
   static constexpr auto none() noexcept -> StateOptions {
     return StateOptions(false, false, false);
   }
@@ -41,13 +65,18 @@ struct StateOptions {
 
 private:
   constexpr explicit StateOptions(bool open_base, bool open_string,
-                                  bool open_table) noexcept
+                                  bool open_table, bool restricted = false,
+                                  u64 instructions = u64()) noexcept
       : open_base_(open_base), open_string_(open_string),
-        open_table_(open_table) {}
+        open_table_(open_table), restricted_(restricted),
+        text_only_(restricted), instructions_(instructions) {}
 
   bool open_base_;
   bool open_string_;
   bool open_table_;
+  bool restricted_;
+  bool text_only_;
+  u64 instructions_;
 };
 
 struct ExecutionReport {
@@ -72,6 +101,15 @@ public:
   auto set_module_resolver(ModuleResolverSpec resolver) -> Result<empty>;
   auto execute_entry(LuaModuleSource source) -> Result<ExecutionReport>;
   auto execute_file(ref<rstd::path::Path> path) -> Result<ExecutionReport>;
+  auto call_module(ref<str> module, ref<str> function, Array arguments)
+      -> Result<Option<Value>>;
+  // Values are snapshots; the function is obtained using a raw table lookup.
+  auto call_module_multi(ref<str> module, ref<str> function, Array arguments)
+      -> Result<Array>;
+  // Counts Lua allocator bytes, excluding host values and callbacks.
+  auto used_memory() const -> Result<usize>;
+  // Zero disables the limit; returns the previous limit.
+  auto set_memory_limit(usize limit) -> Result<usize>;
   auto loaded_modules() const noexcept -> slice<LoadedModule>;
 
 private:
@@ -80,6 +118,8 @@ private:
   auto register_module_table(ModuleSpec module, Option<String> global_name,
                              Option<String> native_identity) -> Result<empty>;
   void reset() noexcept;
+  auto call_module_impl(ref<str> module, ref<str> function, Array arguments,
+                        bool multi) -> Result<Vec<Value>>;
 
   void *storage_;
 };
@@ -125,6 +165,10 @@ struct StateStorage {
   Vec<ModuleFrame> module_stack;
   Vec<LoadedModule> loaded_modules;
   Option<Error> pending_module_error;
+  u64 instruction_limit{}, remaining{};
+  bool text_only{};
+  unsigned hook_interval{};
+  rstd::size_t memory_used{}, memory_limit{};
 
   explicit StateStorage(lua_State *state)
       : lua(state), callbacks(Vec<Box<CallbackSlot>>::make()),
@@ -140,10 +184,48 @@ struct StateStorage {
   }
 };
 
+auto lua_allocator(void *userdata, void *pointer, rstd::size_t old_size,
+                   rstd::size_t new_size) -> void * {
+  auto &storage = *static_cast<StateStorage *>(userdata);
+  if (!pointer)
+    old_size = 0;
+  auto alignment = usize(alignof(max_align_t));
+  if (new_size == 0) {
+    if (pointer) {
+      auto layout = rstd::alloc::Layout::from_size_align_unchecked(
+          usize(old_size), alignment);
+      ::alloc::dealloc(pointer, layout);
+      storage.memory_used -= old_size;
+    }
+    return nullptr;
+  }
+  auto base = storage.memory_used - old_size;
+  if (new_size > static_cast<rstd::size_t>(-1) - base ||
+      (new_size > old_size && storage.memory_limit &&
+       (base > storage.memory_limit || new_size > storage.memory_limit - base)))
+    return nullptr;
+  auto layout =
+      rstd::alloc::Layout::from_size_align(usize(new_size), alignment);
+  if (layout.is_none())
+    return nullptr;
+  void *result;
+  if (pointer) {
+    auto old_layout = rstd::alloc::Layout::from_size_align_unchecked(
+        usize(old_size), alignment);
+    result = ::alloc::realloc(pointer, old_layout, usize(new_size));
+  } else {
+    result = ::alloc::alloc(*layout);
+  }
+  if (result)
+    storage.memory_used = base + new_size;
+  return result;
+}
+
 struct ExecutionGuard {
   StateStorage &storage;
   explicit ExecutionGuard(StateStorage &value) : storage(value) {
     storage.executing = true;
+    storage.remaining = storage.instruction_limit;
   }
   ~ExecutionGuard() { storage.executing = false; }
 };
@@ -214,6 +296,12 @@ auto push_value(lua_State *state, const Value &value) -> bool {
   if (!lua_checkstack(state, 3))
     return false;
   switch (value.tag()) {
+  case Value::Tag::Nil:
+    lua_pushnil(state);
+    return true;
+  case Value::Tag::Number:
+    lua_pushnumber(state, value.as_Number().value.to_primitive());
+    return true;
   case Value::Tag::Integer:
     lua_pushinteger(state, static_cast<lua_Integer>(
                                value.as_Integer().value.to_primitive()));
@@ -530,8 +618,9 @@ auto load_module(StateStorage &storage, lua_State *state, ref<str> requested)
                    ? ""
                    : reinterpret_cast<const char *>(bytes.as_raw_ptr());
   auto name = rstd::move(chunk_name).unwrap_unchecked();
-  auto status = luaL_loadbufferx(state, data, bytes.len().to_primitive(),
-                                 name.as_ptr(), nullptr);
+  auto status =
+      luaL_loadbufferx(state, data, bytes.len().to_primitive(), name.as_ptr(),
+                       storage.text_only ? "t" : nullptr);
   if (status != LUA_OK) {
     auto kind = status == LUA_ERRSYNTAX ? ErrorKind::Syntax
                 : status == LUA_ERRMEM  ? ErrorKind::Memory
@@ -919,10 +1008,11 @@ auto decode_value(Invocation *invocation, int lua_index, String path,
                   Vec<const void *> &ancestors, usize depth) -> Result<Value> {
   auto *lua = invocation->lua;
   switch (lua_type(lua, lua_index)) {
+  case LUA_TNIL:
+    return Ok(Value::Nil());
   case LUA_TNUMBER: {
     if (!lua_isinteger(lua, lua_index)) {
-      return Err(value_type_error(invocation, path.as_str(), "an integer"_str,
-                                  lua_index));
+      return Ok(Value::Number(f64(lua_tonumber(lua, lua_index))));
     }
     auto value = rstd::try_from<i64>(lua_tointeger(lua, lua_index));
     if (value.is_err()) {
@@ -963,9 +1053,10 @@ auto decode_value(Invocation *invocation, int lua_index, String path,
     return Ok(Value::Table(rstd::move(value).unwrap_unchecked()));
   }
   default:
-    return Err(value_type_error(invocation, path.as_str(),
-                                "an integer, boolean, string, or table"_str,
-                                lua_index));
+    return Err(value_type_error(
+        invocation, path.as_str(),
+        "nil, a number, boolean, string, table, or light userdata"_str,
+        lua_index));
   }
 }
 
@@ -1102,13 +1193,18 @@ void State::reset() noexcept {
 }
 
 auto State::create(StateOptions options) -> Result<State> {
-  auto *lua = luaL_newstate();
+  auto storage = Box<StateStorage>::make(nullptr);
+  auto *lua =
+      lua_newstate(lua_allocator, storage.get(), luaL_makeseed(nullptr));
   if (lua == nullptr) {
     return Err(Error::make(ErrorKind::StateCreation, String::make(),
                            "Lua state allocation failed"_Str));
   }
 
-  auto storage = Box<StateStorage>::make(lua);
+  storage->lua = lua;
+  storage->instruction_limit = options.instruction_limit();
+  storage->remaining = storage->instruction_limit;
+  storage->text_only = options.text_only();
   *static_cast<StateStorage **>(lua_getextraspace(lua)) = storage.get();
   lua_atpanic(lua, +[](lua_State *) -> int { return 0; });
 
@@ -1136,8 +1232,52 @@ auto State::create(StateOptions options) -> Result<State> {
   }
 
   lua_settop(lua, 0);
+  if (options.is_restricted()) {
+    const char *hidden[] = {"dofile", "loadfile", "load", "print",
+                            "collectgarbage"};
+    for (const char *name : hidden) {
+      lua_pushnil(lua);
+      lua_setglobal(lua, name);
+    }
+  }
+  if (options.instruction_limit() != u64()) {
+    storage->hook_interval =
+        options.instruction_limit() < u64(1000)
+            ? static_cast<unsigned>(options.instruction_limit().to_primitive())
+            : 1000;
+    lua_sethook(
+        lua,
+        +[](lua_State *state, lua_Debug *) {
+          auto *storage =
+              *static_cast<StateStorage **>(lua_getextraspace(state));
+          if (storage->remaining <= u64(storage->hook_interval)) {
+            storage->remaining = u64();
+            luaL_error(state, "Lua instruction limit exceeded");
+            return;
+          }
+          storage->remaining -= u64(storage->hook_interval);
+        },
+        LUA_MASKCOUNT, static_cast<int>(storage->hook_interval));
+  }
   auto raw = rstd::move(storage).into_raw().as_raw_ptr();
   return Ok(State(static_cast<void *>(raw)));
+}
+
+auto State::used_memory() const -> Result<usize> {
+  if (!storage_)
+    return Err(moved_state_error());
+  return Ok(usize(static_cast<StateStorage *>(storage_)->memory_used));
+}
+
+auto State::set_memory_limit(usize limit) -> Result<usize> {
+  if (!storage_)
+    return Err(moved_state_error());
+  auto &storage = *static_cast<StateStorage *>(storage_);
+  if (storage.executing)
+    return Err(reentrant_state_error());
+  auto previous = storage.memory_limit;
+  storage.memory_limit = limit.to_primitive();
+  return Ok(usize(previous));
 }
 
 auto State::register_module(ModuleSpec module) -> Result<empty> {
@@ -1446,8 +1586,9 @@ auto State::execute_entry(LuaModuleSource source) -> Result<ExecutionReport> {
                    ? ""
                    : reinterpret_cast<const char *>(bytes.as_raw_ptr());
   auto name = rstd::move(chunk_name).unwrap_unchecked();
-  auto status = luaL_loadbufferx(lua, data, bytes.len().to_primitive(),
-                                 name.as_ptr(), nullptr);
+  auto status =
+      luaL_loadbufferx(lua, data, bytes.len().to_primitive(), name.as_ptr(),
+                       storage->text_only ? "t" : nullptr);
   if (status != LUA_OK) {
     auto kind = status == LUA_ERRSYNTAX ? ErrorKind::Syntax
                 : status == LUA_ERRMEM  ? ErrorKind::Memory
@@ -1486,6 +1627,125 @@ auto State::execute_entry(LuaModuleSource source) -> Result<ExecutionReport> {
                             started.elapsed()});
 }
 
+struct ModuleInvocation {
+  StateStorage *storage;
+  ref<str> module;
+  ref<str> function;
+  const Array *arguments;
+  CallbackSlot *slot;
+  bool multi;
+  Vec<Value> output;
+  Option<Error> error;
+};
+
+int invoke_module(lua_State *lua) {
+  auto &request = *static_cast<ModuleInvocation *>(lua_touserdata(lua, 1));
+  auto loaded = load_module(*request.storage, lua, request.module);
+  if (loaded.is_err()) {
+    request.error = Some(rstd::move(loaded).unwrap_err());
+    return 0;
+  }
+  if (!lua_istable(lua, -1)) {
+    request.error = Some(Error::binding("Lua module must return a table"_Str));
+    return 0;
+  }
+  push_string(lua, String::make(request.function));
+  lua_rawget(lua, -2);
+  lua_remove(lua, -2);
+  if (!lua_isfunction(lua, -1)) {
+    request.error = Some(Error::binding(
+        rstd::format("Lua module has no function '{}'", request.function)));
+    return 0;
+  }
+  lua_pushcfunction(lua, traceback_handler);
+  lua_insert(lua, -2);
+  auto handler = lua_gettop(lua) - 1;
+  for (const auto &argument : request.arguments->values()) {
+    if (!push_value(lua, argument)) {
+      request.error =
+          Some(Error::binding("Lua argument stack allocation failed"_Str));
+      return 0;
+    }
+  }
+  auto status =
+      lua_pcall(lua, static_cast<int>(request.arguments->len().to_primitive()),
+                request.multi ? LUA_MULTRET : 1, handler);
+  if (status != LUA_OK) {
+    request.error = Some(error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        request.slot->source.clone()));
+    return 0;
+  }
+  for (int index = handler + 1; index <= lua_gettop(lua); ++index) {
+    Invocation invocation{lua, request.slot};
+    auto ancestors = Vec<const void *>::make();
+    auto value =
+        decode_value(&invocation, index, "return"_Str, ancestors, usize());
+    if (value.is_err()) {
+      request.error = Some(rstd::move(value).unwrap_err());
+      return 0;
+    }
+    request.output.push(rstd::move(value).unwrap());
+  }
+  return 0;
+}
+
+auto State::call_module(ref<str> module, ref<str> function, Array arguments)
+    -> Result<Option<Value>> {
+  auto result =
+      call_module_impl(module, function, rstd::move(arguments), false);
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  auto values = rstd::move(result).unwrap();
+  if (values.is_empty() || values[usize()].is_Nil())
+    return Ok(None());
+  return Ok(Some(values.pop().unwrap()));
+}
+
+auto State::call_module_multi(ref<str> module, ref<str> function,
+                              Array arguments) -> Result<Array> {
+  auto result = call_module_impl(module, function, rstd::move(arguments), true);
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  return Ok(Array::from(rstd::move(result).unwrap()));
+}
+
+auto State::call_module_impl(ref<str> module, ref<str> function,
+                             Array arguments, bool multi)
+    -> Result<Vec<Value>> {
+  if (!storage_)
+    return Err(moved_state_error());
+  auto &storage = *static_cast<StateStorage *>(storage_);
+  if (storage.executing)
+    return Err(reentrant_state_error());
+  if (arguments.len() > usize(64))
+    return Err(Error::binding("too many Lua arguments"_Str));
+  ExecutionGuard guard(storage);
+  auto *lua = storage.lua;
+  auto top = lua_gettop(lua);
+  CallbackSlot slot{String::make(function),
+                    rstd::format("{}.{}", module, function), usize(),
+                    Box<NativeCallback>::make([](CallFrame &) -> BindingResult {
+                      return Ok(usize());
+                    })};
+  ModuleInvocation request{&storage, module, function,           &arguments,
+                           &slot,    multi,  Vec<Value>::make(), None()};
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua call stack allocation failed"_Str));
+  lua_pushcfunction(lua, invoke_module);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 0, 0);
+  if (status != LUA_OK)
+    request.error = Some(error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        slot.source.clone()));
+  clear_callback_transients(&storage);
+  lua_settop(lua, top);
+  if (request.error)
+    return Err(rstd::move(*request.error));
+  return Ok(rstd::move(request.output));
+}
+
 auto State::execute_file(ref<rstd::path::Path> path)
     -> Result<ExecutionReport> {
   if (storage_ == nullptr)
@@ -1505,7 +1765,8 @@ auto State::execute_file(ref<rstd::path::Path> path)
 
   auto started = rstd::time::Instant::now();
   auto owned_path = rstd::move(c_path).unwrap_unchecked();
-  auto status = luaL_loadfilex(lua, owned_path.as_ptr(), nullptr);
+  auto status = luaL_loadfilex(lua, owned_path.as_ptr(),
+                               storage->text_only ? "t" : nullptr);
   if (status != LUA_OK) {
     auto kind = status == LUA_ERRFILE     ? ErrorKind::File
                 : status == LUA_ERRSYNTAX ? ErrorKind::Syntax

@@ -19,7 +19,8 @@ struct OpaqueHandle {
 };
 
 class Value {
-  RSTD_ENUM(Value, (Integer, (i64 value;)), (Boolean, (bool value;)),
+  RSTD_ENUM(Value, (Nil, ()), (Number, (f64 value;)), (Integer, (i64 value;)),
+            (Boolean, (bool value;)),
             (String, (::alloc::string::String value;)),
             (Opaque, (const void *value;)), (Table, (Box<luato::Table> value;)),
             (Array, (Box<luato::Array> value;)))
@@ -194,6 +195,10 @@ inline auto Array::clone() const -> Array {
 
 inline auto Value::type_name() const noexcept -> ref<str> {
   switch (tag()) {
+  case Tag::Nil:
+    return "nil"_str;
+  case Tag::Number:
+    return "number"_str;
   case Tag::Integer:
     return "integer"_str;
   case Tag::Boolean:
@@ -212,6 +217,10 @@ inline auto Value::type_name() const noexcept -> ref<str> {
 
 inline auto Value::clone() const -> Value {
   switch (tag()) {
+  case Tag::Nil:
+    return Nil();
+  case Tag::Number:
+    return Number(as_Number().value);
   case Tag::Integer:
     return Integer(as_Integer().value);
   case Tag::Boolean:
@@ -290,6 +299,12 @@ inline auto Table::scalar_entries() const -> Result<Vec<ScalarEntry>> {
         const auto &entry = *borrowed;
         auto path = field_path(entry.key);
         switch (entry.value.tag()) {
+        case Value::Tag::Nil:
+        case Value::Tag::Number:
+          return Err(Error::make(
+              ErrorKind::Type, String::make(),
+              rstd::format("{} must be an integer, boolean, or string",
+                           path.as_str())));
         case Value::Tag::Integer:
           return Ok(ScalarEntry{
               entry.key.clone(), rstd::move(path),
@@ -413,8 +428,9 @@ concept NativeValue =
     rstd::mtp::any<T, i64, bool, String, Table, Array, OpaqueHandle>;
 
 template <typename T> struct NativeReturn {
-  static constexpr bool supported =
-      NativeValue<T> || rstd::mtp::same_as<T, empty>;
+  static constexpr bool supported = NativeValue<T> ||
+                                    rstd::mtp::same_as<T, Value> ||
+                                    rstd::mtp::same_as<T, empty>;
   static auto push(CallFrame &frame, T value) -> BindingResult
     requires supported
   {
