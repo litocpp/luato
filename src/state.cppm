@@ -1,4 +1,5 @@
 module;
+#include <rstd/enum.hpp>
 #include <stddef.h>
 export module luato:state;
 
@@ -6,6 +7,7 @@ export import :binding;
 export import :module_loader;
 
 import :ffi.lua;
+import rstd;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
@@ -84,6 +86,101 @@ struct ExecutionReport {
   rstd::time::Duration elapsed;
 };
 
+class MultiValue;
+class LuaValue;
+struct LuaValueAccess;
+
+class FunctionHandle {
+public:
+  // Handles do not keep their VM alive and must not be used concurrently.
+  FunctionHandle(const FunctionHandle &) = delete;
+  auto operator=(const FunctionHandle &) -> FunctionHandle & = delete;
+  FunctionHandle(FunctionHandle &&other) noexcept;
+  auto operator=(FunctionHandle &&other) noexcept -> FunctionHandle &;
+  ~FunctionHandle();
+  auto clone() const -> Result<FunctionHandle>;
+  auto same_object(const FunctionHandle &other) const -> Result<bool>;
+  auto call_multi(Array arguments) -> Result<Array>;
+  // Arguments and results retain Lua object identity.
+  auto call_values(MultiValue arguments) -> Result<MultiValue>;
+
+private:
+  explicit FunctionHandle(void *handle) noexcept : handle_(handle) {}
+  void reset() noexcept;
+  void *handle_;
+  friend class TableHandle;
+  friend struct LuaValueAccess;
+};
+
+class TableHandle {
+public:
+  TableHandle(const TableHandle &) = delete;
+  auto operator=(const TableHandle &) -> TableHandle & = delete;
+  TableHandle(TableHandle &&other) noexcept;
+  auto operator=(TableHandle &&other) noexcept -> TableHandle &;
+  ~TableHandle();
+  auto clone() const -> Result<TableHandle>;
+  auto get_function(ref<str> name) -> Result<FunctionHandle>;
+  auto raw_get_function(ref<str> name) -> Result<FunctionHandle>;
+  auto get_table(ref<str> name) -> Result<TableHandle>;
+  auto raw_get_table(ref<str> name) -> Result<TableHandle>;
+  auto same_object(const TableHandle &other) const -> Result<bool>;
+  auto get_value(ref<str> name) -> Result<LuaValue>;
+  auto raw_get_value(ref<str> name) -> Result<LuaValue>;
+  auto get(const LuaValue &key) -> Result<LuaValue>;
+  auto raw_get(const LuaValue &key) -> Result<LuaValue>;
+  auto set(const LuaValue &key, const LuaValue &value) -> Result<empty>;
+  auto raw_set(const LuaValue &key, const LuaValue &value) -> Result<empty>;
+
+private:
+  explicit TableHandle(void *handle) noexcept : handle_(handle) {}
+  void reset() noexcept;
+  auto get_function_impl(ref<str> name, bool raw) -> Result<FunctionHandle>;
+  auto get_table_impl(ref<str> name, bool raw) -> Result<TableHandle>;
+  auto get_value_impl(ref<str> name, bool raw) -> Result<LuaValue>;
+  auto get_impl(const LuaValue &key, bool raw) -> Result<LuaValue>;
+  auto set_impl(const LuaValue &key, const LuaValue &value, bool raw)
+      -> Result<empty>;
+  void *handle_;
+  friend class State;
+  friend struct LuaValueAccess;
+};
+
+// Bytes are owned and may contain invalid UTF-8; tables and functions are
+// handles.
+class LuaValue {
+  RSTD_ENUM(LuaValue, (Nil, ()), (Boolean, (bool value;)),
+            (Integer, (i64 value;)), (Number, (f64 value;)),
+            (Bytes, (Vec<u8> value;)), (Table, (TableHandle value;)),
+            (Function, (FunctionHandle value;)), (Opaque, (const void *value;)))
+public:
+  LuaValue(const LuaValue &) = delete;
+  auto operator=(const LuaValue &) -> LuaValue & = delete;
+  LuaValue(LuaValue &&) noexcept = default;
+  auto operator=(LuaValue &&) noexcept -> LuaValue & = default;
+  auto clone() const -> Result<LuaValue>;
+  // The returned view borrows this value's bytes.
+  auto as_utf8() const & -> Result<ref<str>>;
+  auto as_utf8() const && -> Result<ref<str>> = delete;
+};
+
+class MultiValue {
+public:
+  static auto make() -> MultiValue { return MultiValue(Vec<LuaValue>::make()); }
+  static auto from(Vec<LuaValue> values) -> MultiValue {
+    return MultiValue(rstd::move(values));
+  }
+  auto values() const noexcept -> slice<LuaValue> { return values_.as_slice(); }
+  auto len() const noexcept -> usize { return values_.len(); }
+  auto is_empty() const noexcept -> bool { return values_.is_empty(); }
+  auto into_values() && -> Vec<LuaValue> { return rstd::move(values_); }
+  void push(LuaValue value) { values_.push(rstd::move(value)); }
+
+private:
+  explicit MultiValue(Vec<LuaValue> values) : values_(rstd::move(values)) {}
+  Vec<LuaValue> values_;
+};
+
 class State {
 public:
   State(const State &) = delete;
@@ -100,7 +197,15 @@ public:
       -> Result<empty>;
   auto set_module_resolver(ModuleResolverSpec resolver) -> Result<empty>;
   auto execute_entry(LuaModuleSource source) -> Result<ExecutionReport>;
+  auto evaluate_entry(LuaModuleSource source) -> Result<MultiValue>;
   auto execute_file(ref<rstd::path::Path> path) -> Result<ExecutionReport>;
+  auto module_table(ref<str> module) -> Result<TableHandle>;
+  auto globals() -> Result<TableHandle>;
+  auto create_table() -> Result<TableHandle>;
+  // Copies tables recursively; empty Lua tables decode as Table, not Array.
+  auto snapshot(const LuaValue &value) -> Result<Value>;
+  // Lua removes nil table entries; snapshots containing them are rejected.
+  auto from_snapshot(const Value &value) -> Result<LuaValue>;
   auto call_module(ref<str> module, ref<str> function, Array arguments)
       -> Result<Option<Value>>;
   // Values are snapshots; the function is obtained using a raw table lookup.
@@ -120,6 +225,8 @@ private:
   void reset() noexcept;
   auto call_module_impl(ref<str> module, ref<str> function, Array arguments,
                         bool multi) -> Result<Vec<Value>>;
+  auto execute_entry_impl(LuaModuleSource source, MultiValue *values)
+      -> Result<ExecutionReport>;
 
   void *storage_;
 };
@@ -221,6 +328,15 @@ auto lua_allocator(void *userdata, void *pointer, rstd::size_t old_size,
   return result;
 }
 
+using SharedState = ::alloc::sync::Arc<StateStorage>;
+
+auto read_lua_value(lua_State *lua, int index, SharedState &owner)
+    -> Result<LuaValue>;
+
+auto state_storage(void *owner) -> StateStorage * {
+  return static_cast<SharedState *>(owner)->as_ptr().as_raw_ptr();
+}
+
 struct ExecutionGuard {
   StateStorage &storage;
   explicit ExecutionGuard(StateStorage &value) : storage(value) {
@@ -320,12 +436,17 @@ auto push_value(lua_State *state, const Value &value) -> bool {
     return true;
   case Value::Tag::Table: {
     const auto &table = value.as_Table().value;
-    auto count = rstd::try_from<int>(table->entries().len());
-    if (count.is_err())
-      return false;
-    lua_createtable(state, 0, rstd::move(count).unwrap_unchecked());
+    int capacity;
+    {
+      auto count = rstd::try_from<int>(table->entries().len());
+      if (count.is_err())
+        return false;
+      capacity = rstd::move(count).unwrap_unchecked();
+    }
+    lua_createtable(state, 0, capacity);
     auto output = lua_gettop(state);
-    for (const auto &entry : table->entries()) {
+    for (usize i{}; i < table->entries().len(); ++i) {
+      const auto &entry = table->entries()[i];
       push_string(state, entry.key);
       if (!push_value(state, entry.value))
         return false;
@@ -335,10 +456,14 @@ auto push_value(lua_State *state, const Value &value) -> bool {
   }
   case Value::Tag::Array: {
     const auto &array = value.as_Array().value;
-    auto count = rstd::try_from<int>(array->len());
-    if (count.is_err())
-      return false;
-    lua_createtable(state, rstd::move(count).unwrap_unchecked(), 0);
+    int capacity;
+    {
+      auto count = rstd::try_from<int>(array->len());
+      if (count.is_err())
+        return false;
+      capacity = rstd::move(count).unwrap_unchecked();
+    }
+    lua_createtable(state, capacity, 0);
     auto output = lua_gettop(state);
     for (auto index = usize(); index < array->len(); ++index) {
       if (!push_value(state, array->values()[index]))
@@ -1186,16 +1311,16 @@ State::~State() { reset(); }
 void State::reset() noexcept {
   if (storage_ == nullptr)
     return;
-  auto *raw = static_cast<StateStorage *>(storage_);
+  auto *raw = static_cast<SharedState *>(storage_);
   storage_ = nullptr;
   auto owned =
-      Box<StateStorage>::from_raw(mut_ptr<StateStorage>::from_raw_parts(raw));
+      Box<SharedState>::from_raw(mut_ptr<SharedState>::from_raw_parts(raw));
 }
 
 auto State::create(StateOptions options) -> Result<State> {
-  auto storage = Box<StateStorage>::make(nullptr);
-  auto *lua =
-      lua_newstate(lua_allocator, storage.get(), luaL_makeseed(nullptr));
+  auto owner = SharedState::make(nullptr);
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  auto *lua = lua_newstate(lua_allocator, storage, luaL_makeseed(nullptr));
   if (lua == nullptr) {
     return Err(Error::make(ErrorKind::StateCreation, String::make(),
                            "Lua state allocation failed"_Str));
@@ -1205,7 +1330,7 @@ auto State::create(StateOptions options) -> Result<State> {
   storage->instruction_limit = options.instruction_limit();
   storage->remaining = storage->instruction_limit;
   storage->text_only = options.text_only();
-  *static_cast<StateStorage **>(lua_getextraspace(lua)) = storage.get();
+  *static_cast<StateStorage **>(lua_getextraspace(lua)) = storage;
   lua_atpanic(lua, +[](lua_State *) -> int { return 0; });
 
   if (!lua_checkstack(lua, 2)) {
@@ -1259,20 +1384,21 @@ auto State::create(StateOptions options) -> Result<State> {
         },
         LUA_MASKCOUNT, static_cast<int>(storage->hook_interval));
   }
-  auto raw = rstd::move(storage).into_raw().as_raw_ptr();
+  auto holder = Box<SharedState>::make(rstd::move(owner));
+  auto raw = rstd::move(holder).into_raw().as_raw_ptr();
   return Ok(State(static_cast<void *>(raw)));
 }
 
 auto State::used_memory() const -> Result<usize> {
   if (!storage_)
     return Err(moved_state_error());
-  return Ok(usize(static_cast<StateStorage *>(storage_)->memory_used));
+  return Ok(usize(state_storage(storage_)->memory_used));
 }
 
 auto State::set_memory_limit(usize limit) -> Result<usize> {
   if (!storage_)
     return Err(moved_state_error());
-  auto &storage = *static_cast<StateStorage *>(storage_);
+  auto &storage = *state_storage(storage_);
   if (storage.executing)
     return Err(reentrant_state_error());
   auto previous = storage.memory_limit;
@@ -1290,7 +1416,7 @@ auto State::register_native_require_module(
     NativeRequireModuleSpec specification) -> Result<empty> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
-  auto *storage = static_cast<StateStorage *>(storage_);
+  auto *storage = state_storage(storage_);
   if (storage->executing)
     return Err(reentrant_state_error());
   if (specification.require_name_.is_empty()) {
@@ -1346,7 +1472,7 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
     -> Result<empty> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
-  auto *storage = static_cast<StateStorage *>(storage_);
+  auto *storage = state_storage(storage_);
   if (storage->executing)
     return Err(reentrant_state_error());
   auto *lua = storage->lua;
@@ -1453,7 +1579,7 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
 auto State::set_module_resolver(ModuleResolverSpec resolver) -> Result<empty> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
-  auto *storage = static_cast<StateStorage *>(storage_);
+  auto *storage = state_storage(storage_);
   if (storage->executing)
     return Err(reentrant_state_error());
   if (storage->module_resolver.is_some()) {
@@ -1467,7 +1593,7 @@ auto State::set_module_resolver(ModuleResolverSpec resolver) -> Result<empty> {
 auto State::loaded_modules() const noexcept -> slice<LoadedModule> {
   if (storage_ == nullptr)
     return {};
-  auto *storage = static_cast<const StateStorage *>(storage_);
+  auto *storage = state_storage(storage_);
   return storage->loaded_modules.as_slice();
 }
 
@@ -1552,9 +1678,22 @@ int State::dispatch(void *lua_state) {
 }
 
 auto State::execute_entry(LuaModuleSource source) -> Result<ExecutionReport> {
+  return execute_entry_impl(rstd::move(source), nullptr);
+}
+
+auto State::evaluate_entry(LuaModuleSource source) -> Result<MultiValue> {
+  auto values = MultiValue::make();
+  auto report = execute_entry_impl(rstd::move(source), &values);
+  if (report.is_err())
+    return Err(rstd::move(report).unwrap_err());
+  return Ok(rstd::move(values));
+}
+
+auto State::execute_entry_impl(LuaModuleSource source, MultiValue *values)
+    -> Result<ExecutionReport> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
-  auto *storage = static_cast<StateStorage *>(storage_);
+  auto *storage = state_storage(storage_);
   if (storage->executing)
     return Err(reentrant_state_error());
   auto execution = ExecutionGuard(*storage);
@@ -1621,6 +1760,20 @@ auto State::execute_entry(LuaModuleSource source) -> Result<ExecutionReport> {
     return Err(rstd::move(error));
   }
 
+  if (values) {
+    auto owner = static_cast<SharedState *>(storage_)->clone();
+    auto end = lua_gettop(lua);
+    for (int index = message_handler + 1; index <= end; ++index) {
+      auto value = read_lua_value(lua, index, owner);
+      if (value.is_err()) {
+        auto error = rstd::move(value).unwrap_err();
+        clear_callback_transients(storage);
+        lua_settop(lua, old_top);
+        return Err(rstd::move(error));
+      }
+      values->push(rstd::move(value).unwrap());
+    }
+  }
   clear_callback_transients(storage);
   lua_settop(lua, old_top);
   return Ok(ExecutionReport{rstd::path::PathBuf::from(display_path.as_str()),
@@ -1715,7 +1868,7 @@ auto State::call_module_impl(ref<str> module, ref<str> function,
     -> Result<Vec<Value>> {
   if (!storage_)
     return Err(moved_state_error());
-  auto &storage = *static_cast<StateStorage *>(storage_);
+  auto &storage = *state_storage(storage_);
   if (storage.executing)
     return Err(reentrant_state_error());
   if (arguments.len() > usize(64))
@@ -1746,11 +1899,848 @@ auto State::call_module_impl(ref<str> module, ref<str> function,
   return Ok(rstd::move(request.output));
 }
 
+struct RegistryHandle {
+  ::alloc::sync::Weak<StateStorage> owner;
+  int reference;
+  RegistryHandle(SharedState state, int value)
+      : owner(state.downgrade()), reference(value) {}
+  ~RegistryHandle() {
+    auto state = owner.upgrade();
+    if (state)
+      luaL_unref(state.as_ptr().as_raw_ptr()->lua, LUA_REGISTRYINDEX,
+                 reference);
+  }
+};
+
+using SharedRegistry = ::alloc::sync::Arc<RegistryHandle>;
+
+auto registry_handle(void *handle) -> RegistryHandle * {
+  return static_cast<SharedRegistry *>(handle)->as_ptr().as_raw_ptr();
+}
+
+auto make_registry_handle(SharedState owner, int reference) -> void * {
+  auto shared = SharedRegistry::make(rstd::move(owner), reference);
+  auto box = Box<SharedRegistry>::make(rstd::move(shared));
+  return rstd::move(box).into_raw().as_raw_ptr();
+}
+
+struct LuaValueAccess {
+  static auto table(void *handle) -> TableHandle { return TableHandle(handle); }
+  static auto function(void *handle) -> FunctionHandle {
+    return FunctionHandle(handle);
+  }
+  static auto handle(const TableHandle &value) -> void * {
+    return value.handle_;
+  }
+  static auto handle(const FunctionHandle &value) -> void * {
+    return value.handle_;
+  }
+};
+
+auto LuaValue::clone() const -> Result<LuaValue> {
+  switch (tag()) {
+  case Tag::Nil:
+    return Ok(Nil());
+  case Tag::Boolean:
+    return Ok(Boolean(as_Boolean().value));
+  case Tag::Integer:
+    return Ok(Integer(as_Integer().value));
+  case Tag::Number:
+    return Ok(Number(as_Number().value));
+  case Tag::Bytes:
+    return Ok(Bytes(Vec<u8>::from(as_Bytes().value.as_slice())));
+  case Tag::Opaque:
+    return Ok(Opaque(as_Opaque().value));
+  case Tag::Table: {
+    auto copy = as_Table().value.clone();
+    if (copy.is_err())
+      return Err(rstd::move(copy).unwrap_err());
+    return Ok(Table(rstd::move(copy).unwrap()));
+  }
+  case Tag::Function: {
+    auto copy = as_Function().value.clone();
+    if (copy.is_err())
+      return Err(rstd::move(copy).unwrap_err());
+    return Ok(Function(rstd::move(copy).unwrap()));
+  }
+  }
+  return Err(Error::binding("invalid Lua value"_Str));
+}
+
+auto LuaValue::as_utf8() const & -> Result<ref<str>> {
+  if (!is_Bytes())
+    return Err(Error::make(ErrorKind::Type, String::make(),
+                           "expected a Lua string"_Str));
+  auto text = rstd::str_::from_utf8(as_Bytes().value.as_slice());
+  if (text.is_err())
+    return Err(Error::make(ErrorKind::Type, String::make(),
+                           "Lua string is not valid UTF-8"_Str));
+  return Ok(rstd::move(text).unwrap());
+}
+
+auto clone_registry_handle(void *handle) -> void * {
+  auto box =
+      Box<SharedRegistry>::make(static_cast<SharedRegistry *>(handle)->clone());
+  return rstd::move(box).into_raw().as_raw_ptr();
+}
+
+auto validate_lua_value(const LuaValue &value, const SharedState &owner)
+    -> Result<empty> {
+  void *raw = nullptr;
+  if (value.is_Table())
+    raw = LuaValueAccess::handle(value.as_Table().value);
+  else if (value.is_Function())
+    raw = LuaValueAccess::handle(value.as_Function().value);
+  else
+    return Ok(empty{});
+  if (!raw)
+    return Err(Error::binding("Lua handle was moved"_Str));
+  auto object_owner = registry_handle(raw)->owner.upgrade();
+  if (!object_owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  if (!SharedState::ptr_eq(owner, object_owner))
+    return Err(Error::binding("Lua handles belong to different states"_Str));
+  return Ok(empty{});
+}
+
+// Call only after validating the handle owners under the outer protected call.
+void push_lua_value(lua_State *lua, const LuaValue &value) {
+  switch (value.tag()) {
+  case LuaValue::Tag::Nil:
+    lua_pushnil(lua);
+    return;
+  case LuaValue::Tag::Boolean:
+    lua_pushboolean(lua, value.as_Boolean().value);
+    return;
+  case LuaValue::Tag::Integer:
+    lua_pushinteger(
+        lua, static_cast<lua_Integer>(value.as_Integer().value.to_primitive()));
+    return;
+  case LuaValue::Tag::Number:
+    lua_pushnumber(lua, value.as_Number().value.to_primitive());
+    return;
+  case LuaValue::Tag::Bytes: {
+    auto bytes = value.as_Bytes().value.as_slice();
+    lua_pushlstring(lua, reinterpret_cast<const char *>(bytes.as_raw_ptr()),
+                    bytes.len().to_primitive());
+    return;
+  }
+  case LuaValue::Tag::Opaque:
+    lua_pushlightuserdata(lua, const_cast<void *>(value.as_Opaque().value));
+    return;
+  case LuaValue::Tag::Table:
+    lua_rawgeti(lua, LUA_REGISTRYINDEX,
+                registry_handle(LuaValueAccess::handle(value.as_Table().value))
+                    ->reference);
+    return;
+  case LuaValue::Tag::Function:
+    lua_rawgeti(
+        lua, LUA_REGISTRYINDEX,
+        registry_handle(LuaValueAccess::handle(value.as_Function().value))
+            ->reference);
+    return;
+  }
+}
+
+int create_lua_value_reference(lua_State *lua) {
+  auto *reference = static_cast<int *>(lua_touserdata(lua, 2));
+  lua_pushvalue(lua, 1);
+  *reference = luaL_ref(lua, LUA_REGISTRYINDEX);
+  return 0;
+}
+
+auto read_lua_value(lua_State *lua, int index, SharedState &owner)
+    -> Result<LuaValue> {
+  index = lua_absindex(lua, index);
+  switch (lua_type(lua, index)) {
+  case LUA_TNIL:
+    return Ok(LuaValue::Nil());
+  case LUA_TBOOLEAN:
+    return Ok(LuaValue::Boolean(lua_toboolean(lua, index) != 0));
+  case LUA_TNUMBER:
+    if (lua_isinteger(lua, index)) {
+      auto value = rstd::try_from<i64>(lua_tointeger(lua, index));
+      if (value.is_err())
+        return Err(Error::binding("Lua integer is out of range"_Str));
+      return Ok(LuaValue::Integer(rstd::move(value).unwrap()));
+    }
+    return Ok(LuaValue::Number(f64(lua_tonumber(lua, index))));
+  case LUA_TSTRING: {
+    rstd::size_t length{};
+    auto *data = lua_tolstring(lua, index, &length);
+    auto bytes = slice<u8>::from_raw_parts(reinterpret_cast<const byte *>(data),
+                                           usize(length));
+    return Ok(LuaValue::Bytes(Vec<u8>::from(bytes)));
+  }
+  case LUA_TLIGHTUSERDATA:
+    return Ok(LuaValue::Opaque(lua_touserdata(lua, index)));
+  case LUA_TTABLE:
+  case LUA_TFUNCTION: {
+    bool table = lua_istable(lua, index);
+    if (!lua_checkstack(lua, 3))
+      return Err(Error::binding("Lua reference stack allocation failed"_Str));
+    int reference = LUA_NOREF;
+    lua_pushcfunction(lua, create_lua_value_reference);
+    lua_pushvalue(lua, index);
+    lua_pushlightuserdata(lua, &reference);
+    auto status = lua_pcall(lua, 2, 0, 0);
+    if (status != LUA_OK) {
+      auto error = error_from_top(
+          lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+          "reference"_Str);
+      lua_pop(lua, 1);
+      return Err(rstd::move(error));
+    }
+    auto raw = make_registry_handle(owner.clone(), reference);
+    if (table)
+      return Ok(LuaValue::Table(LuaValueAccess::table(raw)));
+    return Ok(LuaValue::Function(LuaValueAccess::function(raw)));
+  }
+  default:
+    return Err(Error::make(ErrorKind::Type, String::make(),
+                           "unsupported Lua value type"_Str));
+  }
+}
+
+struct SnapshotRequest {
+  const Value *snapshot;
+  const LuaValue *value;
+  CallbackSlot *slot;
+  bool push_failed;
+  Option<Value> result;
+  Option<Error> error;
+};
+
+int push_snapshot(lua_State *lua) {
+  auto &request = *static_cast<SnapshotRequest *>(lua_touserdata(lua, 1));
+  if (!push_value(lua, *request.snapshot)) {
+    request.push_failed = true;
+    return 0;
+  }
+  return 1;
+}
+
+int decode_snapshot(lua_State *lua) {
+  auto &request = *static_cast<SnapshotRequest *>(lua_touserdata(lua, 1));
+  push_lua_value(lua, *request.value);
+  Invocation invocation{lua, request.slot};
+  auto ancestors = Vec<const void *>::make();
+  auto result = decode_value(&invocation, -1, "value"_Str, ancestors, usize());
+  if (result.is_err())
+    request.error = Some(rstd::move(result).unwrap_err());
+  else
+    request.result = Some(rstd::move(result).unwrap());
+  return 0;
+}
+
+auto validate_snapshot(const Value &value, usize depth) -> Result<empty> {
+  if (value.is_Table()) {
+    if (depth >= usize(32))
+      return Err(Error::make(ErrorKind::Type, String::make(),
+                             "snapshot exceeds the maximum table depth"_Str));
+    for (const auto &entry : value.as_Table().value->entries()) {
+      if (entry.value.is_Nil())
+        return Err(Error::make(ErrorKind::Type, String::make(),
+                               "Lua tables cannot preserve nil entries"_Str));
+      auto valid = validate_snapshot(entry.value, depth + usize(1));
+      if (valid.is_err())
+        return Err(rstd::move(valid).unwrap_err());
+    }
+  } else if (value.is_Array()) {
+    if (depth >= usize(32))
+      return Err(Error::make(ErrorKind::Type, String::make(),
+                             "snapshot exceeds the maximum table depth"_Str));
+    for (const auto &entry : value.as_Array().value->values()) {
+      if (entry.is_Nil())
+        return Err(Error::make(ErrorKind::Type, String::make(),
+                               "Lua arrays cannot preserve nil entries"_Str));
+      auto valid = validate_snapshot(entry, depth + usize(1));
+      if (valid.is_err())
+        return Err(rstd::move(valid).unwrap_err());
+    }
+  }
+  return Ok(empty{});
+}
+
+auto State::from_snapshot(const Value &value) -> Result<LuaValue> {
+  if (!storage_)
+    return Err(moved_state_error());
+  auto owner = static_cast<SharedState *>(storage_)->clone();
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  auto valid = validate_snapshot(value, usize());
+  if (valid.is_err())
+    return Err(rstd::move(valid).unwrap_err());
+  ExecutionGuard guard(*storage);
+  auto *lua = storage->lua;
+  auto top = lua_gettop(lua);
+  SnapshotRequest request{&value, nullptr, nullptr, false, None(), None()};
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua conversion stack allocation failed"_Str));
+  lua_pushcfunction(lua, push_snapshot);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 1, 0);
+  if (status != LUA_OK) {
+    auto error = error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "snapshot"_Str);
+    clear_callback_transients(storage);
+    lua_settop(lua, top);
+    return Err(rstd::move(error));
+  }
+  if (request.push_failed) {
+    lua_settop(lua, top);
+    return Err(Error::binding("Lua snapshot conversion failed"_Str));
+  }
+  auto result = read_lua_value(lua, -1, owner);
+  clear_callback_transients(storage);
+  lua_settop(lua, top);
+  return result;
+}
+
+auto State::snapshot(const LuaValue &value) -> Result<Value> {
+  if (!storage_)
+    return Err(moved_state_error());
+  auto owner = static_cast<SharedState *>(storage_)->clone();
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  auto valid = validate_lua_value(value, owner);
+  if (valid.is_err())
+    return Err(rstd::move(valid).unwrap_err());
+  ExecutionGuard guard(*storage);
+  auto *lua = storage->lua;
+  auto top = lua_gettop(lua);
+  CallbackSlot slot{"snapshot"_Str, "snapshot"_Str, usize(),
+                    Box<NativeCallback>::make([](CallFrame &) -> BindingResult {
+                      return Ok(usize());
+                    })};
+  SnapshotRequest request{nullptr, &value, &slot, false, None(), None()};
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua conversion stack allocation failed"_Str));
+  lua_pushcfunction(lua, decode_snapshot);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 0, 0);
+  if (status != LUA_OK)
+    request.error = Some(error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "snapshot"_Str));
+  clear_callback_transients(storage);
+  lua_settop(lua, top);
+  if (request.error)
+    return Err(rstd::move(*request.error));
+  if (request.result.is_none())
+    return Err(Error::binding("Lua snapshot conversion returned no value"_Str));
+  return Ok(rstd::move(*request.result));
+}
+
+void drop_registry_handle(void *handle) noexcept {
+  if (!handle)
+    return;
+  auto owned =
+      Box<SharedRegistry>::from_raw(mut_ptr<SharedRegistry>::from_raw_parts(
+          static_cast<SharedRegistry *>(handle)));
+}
+
+TableHandle::TableHandle(TableHandle &&other) noexcept
+    : handle_(rstd::exchange(other.handle_, nullptr)) {}
+auto TableHandle::operator=(TableHandle &&other) noexcept -> TableHandle & {
+  if (this != &other) {
+    reset();
+    handle_ = rstd::exchange(other.handle_, nullptr);
+  }
+  return *this;
+}
+TableHandle::~TableHandle() { reset(); }
+auto TableHandle::clone() const -> Result<TableHandle> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  return Ok(TableHandle(clone_registry_handle(handle_)));
+}
+void TableHandle::reset() noexcept {
+  drop_registry_handle(rstd::exchange(handle_, nullptr));
+}
+FunctionHandle::FunctionHandle(FunctionHandle &&other) noexcept
+    : handle_(rstd::exchange(other.handle_, nullptr)) {}
+auto FunctionHandle::operator=(FunctionHandle &&other) noexcept
+    -> FunctionHandle & {
+  if (this != &other) {
+    reset();
+    handle_ = rstd::exchange(other.handle_, nullptr);
+  }
+  return *this;
+}
+FunctionHandle::~FunctionHandle() { reset(); }
+auto FunctionHandle::clone() const -> Result<FunctionHandle> {
+  if (!handle_)
+    return Err(Error::binding("Lua function handle was moved"_Str));
+  return Ok(FunctionHandle(clone_registry_handle(handle_)));
+}
+void FunctionHandle::reset() noexcept {
+  drop_registry_handle(rstd::exchange(handle_, nullptr));
+}
+
+struct LookupRequest {
+  StateStorage *storage;
+  ref<str> name;
+  int result;
+  Option<Error> error;
+};
+
+int load_table_handle(lua_State *lua) {
+  auto &request = *static_cast<LookupRequest *>(lua_touserdata(lua, 1));
+  {
+    auto loaded = load_module(*request.storage, lua, request.name);
+    if (loaded.is_err()) {
+      request.error = Some(rstd::move(loaded).unwrap_err());
+      return 0;
+    }
+  }
+  if (!lua_istable(lua, -1)) {
+    request.error = Some(Error::binding("Lua module must return a table"_Str));
+    return 0;
+  }
+  request.result = luaL_ref(lua, LUA_REGISTRYINDEX);
+  return 0;
+}
+
+int global_table_handle(lua_State *lua) {
+  auto &request = *static_cast<LookupRequest *>(lua_touserdata(lua, 1));
+  lua_pushglobaltable(lua);
+  request.result = luaL_ref(lua, LUA_REGISTRYINDEX);
+  return 0;
+}
+
+int create_table_handle(lua_State *lua) {
+  auto &request = *static_cast<LookupRequest *>(lua_touserdata(lua, 1));
+  lua_newtable(lua);
+  request.result = luaL_ref(lua, LUA_REGISTRYINDEX);
+  return 0;
+}
+
+auto perform_handle_lookup(SharedState &owner, ref<str> name,
+                           int (*operation)(lua_State *)) -> Result<int> {
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  ExecutionGuard guard(*storage);
+  auto *lua = storage->lua;
+  auto top = lua_gettop(lua);
+  LookupRequest request{storage, name, LUA_NOREF, None()};
+  if (!lua_checkstack(lua, 3))
+    return Err(Error::binding("Lua lookup stack allocation failed"_Str));
+  lua_pushcfunction(lua, operation);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 0, 0);
+  if (status != LUA_OK)
+    request.error = Some(error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        String::make(name)));
+  clear_callback_transients(storage);
+  lua_settop(lua, top);
+  if (request.error)
+    return Err(rstd::move(*request.error));
+  return Ok(request.result);
+}
+
+auto State::module_table(ref<str> module) -> Result<TableHandle> {
+  if (!storage_)
+    return Err(moved_state_error());
+  auto owner = static_cast<SharedState *>(storage_)->clone();
+  auto result = perform_handle_lookup(owner, module, load_table_handle);
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  return Ok(
+      TableHandle(make_registry_handle(rstd::move(owner), result.unwrap())));
+}
+
+auto State::globals() -> Result<TableHandle> {
+  if (!storage_)
+    return Err(moved_state_error());
+  auto owner = static_cast<SharedState *>(storage_)->clone();
+  auto result =
+      perform_handle_lookup(owner, "globals"_str, global_table_handle);
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  return Ok(
+      TableHandle(make_registry_handle(rstd::move(owner), result.unwrap())));
+}
+
+auto State::create_table() -> Result<TableHandle> {
+  if (!storage_)
+    return Err(moved_state_error());
+  auto owner = static_cast<SharedState *>(storage_)->clone();
+  auto result = perform_handle_lookup(owner, "table"_str, create_table_handle);
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  return Ok(
+      TableHandle(make_registry_handle(rstd::move(owner), result.unwrap())));
+}
+
+auto TableHandle::get_function(ref<str> name) -> Result<FunctionHandle> {
+  return get_function_impl(name, false);
+}
+auto TableHandle::raw_get_function(ref<str> name) -> Result<FunctionHandle> {
+  return get_function_impl(name, true);
+}
+auto TableHandle::get_function_impl(ref<str> name, bool raw)
+    -> Result<FunctionHandle> {
+  auto result = get_value_impl(name, raw);
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  auto value = rstd::move(result).unwrap();
+  if (!value.is_Function())
+    return Err(Error::binding("Lua table field is not a function"_Str));
+  return Ok(rstd::move(value.as_Function().value));
+}
+
+auto TableHandle::get_table(ref<str> name) -> Result<TableHandle> {
+  return get_table_impl(name, false);
+}
+auto TableHandle::raw_get_table(ref<str> name) -> Result<TableHandle> {
+  return get_table_impl(name, true);
+}
+auto TableHandle::get_table_impl(ref<str> name, bool raw)
+    -> Result<TableHandle> {
+  auto result = get_value_impl(name, raw);
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  auto value = rstd::move(result).unwrap();
+  if (!value.is_Table())
+    return Err(Error::binding("Lua table field is not a table"_Str));
+  return Ok(rstd::move(value.as_Table().value));
+}
+
+struct ValueLookupRequest {
+  int reference;
+  const LuaValue *key;
+  const LuaValue *value;
+  bool raw;
+};
+
+int lookup_lua_value(lua_State *lua) {
+  auto &request = *static_cast<ValueLookupRequest *>(lua_touserdata(lua, 1));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, request.reference);
+  push_lua_value(lua, *request.key);
+  if (request.raw)
+    lua_rawget(lua, -2);
+  else
+    lua_gettable(lua, -2);
+  return 1;
+}
+
+int set_lua_value(lua_State *lua) {
+  auto &request = *static_cast<ValueLookupRequest *>(lua_touserdata(lua, 1));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, request.reference);
+  push_lua_value(lua, *request.key);
+  push_lua_value(lua, *request.value);
+  if (request.raw)
+    lua_rawset(lua, -3);
+  else
+    lua_settable(lua, -3);
+  return 0;
+}
+
+auto TableHandle::get_value(ref<str> name) -> Result<LuaValue> {
+  return get_value_impl(name, false);
+}
+auto TableHandle::raw_get_value(ref<str> name) -> Result<LuaValue> {
+  return get_value_impl(name, true);
+}
+auto TableHandle::get_value_impl(ref<str> name, bool raw) -> Result<LuaValue> {
+  auto key = LuaValue::Bytes(Vec<u8>::from(name.as_bytes()));
+  return get_impl(key, raw);
+}
+auto TableHandle::get(const LuaValue &key) -> Result<LuaValue> {
+  return get_impl(key, false);
+}
+auto TableHandle::raw_get(const LuaValue &key) -> Result<LuaValue> {
+  return get_impl(key, true);
+}
+auto TableHandle::get_impl(const LuaValue &key, bool raw) -> Result<LuaValue> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  auto valid = validate_lua_value(key, owner);
+  if (valid.is_err())
+    return Err(rstd::move(valid).unwrap_err());
+  ExecutionGuard guard(*storage);
+  auto *lua = storage->lua;
+  auto top = lua_gettop(lua);
+  ValueLookupRequest request{handle.reference, &key, nullptr, raw};
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua lookup stack allocation failed"_Str));
+  lua_pushcfunction(lua, lookup_lua_value);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 1, 0);
+  if (status != LUA_OK) {
+    auto error = error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "table lookup"_Str);
+    clear_callback_transients(storage);
+    lua_settop(lua, top);
+    return Err(rstd::move(error));
+  }
+  auto value = read_lua_value(lua, -1, owner);
+  clear_callback_transients(storage);
+  lua_settop(lua, top);
+  return value;
+}
+
+auto TableHandle::set(const LuaValue &key, const LuaValue &value)
+    -> Result<empty> {
+  return set_impl(key, value, false);
+}
+auto TableHandle::raw_set(const LuaValue &key, const LuaValue &value)
+    -> Result<empty> {
+  return set_impl(key, value, true);
+}
+auto TableHandle::set_impl(const LuaValue &key, const LuaValue &value, bool raw)
+    -> Result<empty> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  auto valid_key = validate_lua_value(key, owner);
+  if (valid_key.is_err())
+    return Err(rstd::move(valid_key).unwrap_err());
+  auto valid_value = validate_lua_value(value, owner);
+  if (valid_value.is_err())
+    return Err(rstd::move(valid_value).unwrap_err());
+  ExecutionGuard guard(*storage);
+  auto *lua = storage->lua;
+  auto top = lua_gettop(lua);
+  ValueLookupRequest request{handle.reference, &key, &value, raw};
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua set stack allocation failed"_Str));
+  lua_pushcfunction(lua, set_lua_value);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 0, 0);
+  if (status != LUA_OK) {
+    auto error = error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "table set"_Str);
+    clear_callback_transients(storage);
+    lua_settop(lua, top);
+    return Err(rstd::move(error));
+  }
+  clear_callback_transients(storage);
+  lua_settop(lua, top);
+  return Ok(empty{});
+}
+
+auto same_registry_object(void *left_handle, void *right_handle)
+    -> Result<bool> {
+  if (!left_handle || !right_handle)
+    return Err(Error::binding("Lua object handle was moved"_Str));
+  auto &left = *registry_handle(left_handle);
+  auto &right = *registry_handle(right_handle);
+  auto owner = left.owner.upgrade();
+  auto other_owner = right.owner.upgrade();
+  if (!owner || !other_owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  if (!SharedState::ptr_eq(owner, other_owner))
+    return Err(Error::binding("Lua handles belong to different states"_Str));
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  auto *lua = storage->lua;
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua comparison stack allocation failed"_Str));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, left.reference);
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, right.reference);
+  auto equal = lua_rawequal(lua, -1, -2) != 0;
+  lua_pop(lua, 2);
+  return Ok(equal);
+}
+
+auto TableHandle::same_object(const TableHandle &other) const -> Result<bool> {
+  return same_registry_object(handle_, other.handle_);
+}
+
+auto FunctionHandle::same_object(const FunctionHandle &other) const
+    -> Result<bool> {
+  return same_registry_object(handle_, other.handle_);
+}
+
+struct FunctionRequest {
+  int reference;
+  const Array *arguments;
+  CallbackSlot *slot;
+  Vec<Value> output;
+  Option<Error> error;
+};
+
+int invoke_function_handle(lua_State *lua) {
+  auto &request = *static_cast<FunctionRequest *>(lua_touserdata(lua, 1));
+  lua_pushcfunction(lua, traceback_handler);
+  auto handler = lua_gettop(lua);
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, request.reference);
+  for (const auto &argument : request.arguments->values()) {
+    if (!push_value(lua, argument)) {
+      request.error =
+          Some(Error::binding("Lua argument stack allocation failed"_Str));
+      return 0;
+    }
+  }
+  auto status =
+      lua_pcall(lua, static_cast<int>(request.arguments->len().to_primitive()),
+                LUA_MULTRET, handler);
+  if (status != LUA_OK) {
+    request.error = Some(error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        request.slot->source.clone()));
+    return 0;
+  }
+  for (int index = handler + 1; index <= lua_gettop(lua); ++index) {
+    Invocation invocation{lua, request.slot};
+    auto ancestors = Vec<const void *>::make();
+    auto value =
+        decode_value(&invocation, index, "return"_Str, ancestors, usize());
+    if (value.is_err()) {
+      request.error = Some(rstd::move(value).unwrap_err());
+      return 0;
+    }
+    request.output.push(rstd::move(value).unwrap());
+  }
+  return 0;
+}
+
+auto FunctionHandle::call_multi(Array arguments) -> Result<Array> {
+  if (!handle_)
+    return Err(Error::binding("Lua function handle was moved"_Str));
+  if (arguments.len() > usize(64))
+    return Err(Error::binding("too many Lua arguments"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  ExecutionGuard guard(*storage);
+  auto *lua = storage->lua;
+  auto top = lua_gettop(lua);
+  CallbackSlot slot{"function"_Str, "function"_Str, usize(),
+                    Box<NativeCallback>::make([](CallFrame &) -> BindingResult {
+                      return Ok(usize());
+                    })};
+  FunctionRequest request{handle.reference, &arguments, &slot,
+                          Vec<Value>::make(), None()};
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua call stack allocation failed"_Str));
+  lua_pushcfunction(lua, invoke_function_handle);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 0, 0);
+  if (status != LUA_OK)
+    request.error = Some(error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        slot.source.clone()));
+  clear_callback_transients(storage);
+  lua_settop(lua, top);
+  if (request.error)
+    return Err(rstd::move(*request.error));
+  return Ok(Array::from(rstd::move(request.output)));
+}
+
+struct DynamicCallRequest {
+  int reference;
+  const MultiValue *arguments;
+  bool stack_failed;
+};
+
+int invoke_dynamic_function(lua_State *lua) {
+  auto &request = *static_cast<DynamicCallRequest *>(lua_touserdata(lua, 1));
+  if (!lua_checkstack(
+          lua, static_cast<int>(request.arguments->len().to_primitive()) + 2)) {
+    request.stack_failed = true;
+    return 0;
+  }
+  lua_pushcfunction(lua, traceback_handler);
+  auto handler = lua_gettop(lua);
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, request.reference);
+  for (rstd::size_t i = 0; i < request.arguments->len().to_primitive(); ++i)
+    push_lua_value(lua, request.arguments->values()[usize(i)]);
+  auto status =
+      lua_pcall(lua, static_cast<int>(request.arguments->len().to_primitive()),
+                LUA_MULTRET, handler);
+  if (status != LUA_OK)
+    return lua_error(lua);
+  return lua_gettop(lua) - handler;
+}
+
+auto FunctionHandle::call_values(MultiValue arguments) -> Result<MultiValue> {
+  if (!handle_)
+    return Err(Error::binding("Lua function handle was moved"_Str));
+  if (arguments.len() > usize(64))
+    return Err(Error::binding("too many Lua arguments"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  for (const auto &value : arguments.values()) {
+    auto valid = validate_lua_value(value, owner);
+    if (valid.is_err())
+      return Err(rstd::move(valid).unwrap_err());
+  }
+  ExecutionGuard guard(*storage);
+  auto *lua = storage->lua;
+  auto top = lua_gettop(lua);
+  DynamicCallRequest request{handle.reference, &arguments, false};
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua call stack allocation failed"_Str));
+  lua_pushcfunction(lua, invoke_dynamic_function);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, LUA_MULTRET, 0);
+  if (status != LUA_OK) {
+    auto error = error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "function"_Str);
+    clear_callback_transients(storage);
+    lua_settop(lua, top);
+    return Err(rstd::move(error));
+  }
+  if (request.stack_failed) {
+    lua_settop(lua, top);
+    return Err(Error::binding("Lua call stack allocation failed"_Str));
+  }
+  auto result = MultiValue::make();
+  auto end = lua_gettop(lua);
+  for (int index = top + 1; index <= end; ++index) {
+    auto value = read_lua_value(lua, index, owner);
+    if (value.is_err()) {
+      auto error = rstd::move(value).unwrap_err();
+      clear_callback_transients(storage);
+      lua_settop(lua, top);
+      return Err(rstd::move(error));
+    }
+    result.push(rstd::move(value).unwrap());
+  }
+  clear_callback_transients(storage);
+  lua_settop(lua, top);
+  return Ok(rstd::move(result));
+}
+
 auto State::execute_file(ref<rstd::path::Path> path)
     -> Result<ExecutionReport> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
-  auto *storage = static_cast<StateStorage *>(storage_);
+  auto *storage = state_storage(storage_);
   if (storage->executing)
     return Err(reentrant_state_error());
   auto execution = ExecutionGuard(*storage);
