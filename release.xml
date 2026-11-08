@@ -1,0 +1,9 @@
+<release version="0.1.1" date="2026-11-08">
+  <description>
+    <ul>
+      <li>Add Lua table and function handles with dynamic values and multiple returns.</li>
+      <li>Add typed native function bindings and Lua execution controls.</li>
+      <li>Add explicit Lua value and snapshot conversion.</li>
+    </ul>
+  </description>
+</release>

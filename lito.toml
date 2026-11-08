@@ -1,6 +1,6 @@
 [package]
 name = "luato"
-version = "0.1.0"
+version = "0.1.1"
 license = "MIT OR Apache-2.0"
 
 [lib]
@@ -28,6 +28,6 @@ exceptions = false
 rtti = false
 
 [dependencies]
-rstd-std = { version = "0.1.0", pub = true }
-rstd-parse = { version = "0.1.0", pub = true }
-luato-lua = { path = "src/lua", pub = true }
+rstd-std = { version = "0.1.12", pub = true }
+rstd-parse = { version = "0.1.12", pub = true }
+luato-lua = { path = "src/lua", version = "5.5.1", pub = true }
