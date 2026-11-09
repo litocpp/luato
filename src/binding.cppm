@@ -443,6 +443,8 @@ private:
 using NativeCallback = dyn<FnMut<BindingResult(CallFrame &)>>;
 using AsyncNativeStarter =
     dyn<FnMut<Result<rstd::async::coro<Result<Array>>>(CallFrame &)>>;
+using AsyncHandleStarter =
+    dyn<FnMut<Result<rstd::async::coro<Result<OpaqueHandle>>>(CallFrame &)>>;
 
 } // namespace luato
 
@@ -731,11 +733,39 @@ private:
   friend class State;
 };
 
+class AsyncNativeHandleFunctionSpec {
+public:
+  AsyncNativeHandleFunctionSpec(AsyncNativeHandleFunctionSpec &&) noexcept =
+      default;
+  AsyncNativeHandleFunctionSpec &
+  operator=(AsyncNativeHandleFunctionSpec &&) noexcept = default;
+
+  template <typename Callable>
+  static auto make(String name, usize arity, Callable &&callable)
+      -> AsyncNativeHandleFunctionSpec {
+    return AsyncNativeHandleFunctionSpec(
+        rstd::move(name), arity,
+        Box<AsyncHandleStarter>::make(rstd::forward<Callable>(callable)));
+  }
+
+private:
+  AsyncNativeHandleFunctionSpec(String name, usize arity,
+                                Box<AsyncHandleStarter> starter)
+      : name_(rstd::move(name)), arity_(arity), starter_(rstd::move(starter)) {}
+
+  String name_;
+  usize arity_;
+  Box<AsyncHandleStarter> starter_;
+
+  friend class State;
+};
+
 class ModuleSpec {
 public:
   explicit ModuleSpec(String name)
       : name_(rstd::move(name)), functions_(Vec<NativeFunctionSpec>::make()),
         async_functions_(Vec<AsyncNativeFunctionSpec>::make()),
+        async_handle_functions_(Vec<AsyncNativeHandleFunctionSpec>::make()),
         fields_(Vec<TableEntry>::make()) {}
 
   ModuleSpec(ModuleSpec &&) noexcept = default;
@@ -793,6 +823,7 @@ private:
   String name_;
   Vec<NativeFunctionSpec> functions_;
   Vec<AsyncNativeFunctionSpec> async_functions_;
+  Vec<AsyncNativeHandleFunctionSpec> async_handle_functions_;
   Vec<TableEntry> fields_;
 
   friend class State;
