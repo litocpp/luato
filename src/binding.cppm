@@ -14,6 +14,8 @@ export namespace luato {
 class State;
 class Table;
 class Array;
+class LuaValue;
+class CallFrame;
 
 struct OpaqueHandle {
   const void *identity{};
@@ -346,6 +348,12 @@ public:
 
   auto argument_count() const noexcept -> usize { return argument_count_; }
 
+  auto argument(usize index) -> Result<OpaqueHandle> {
+    return read_value_(context_, index);
+  }
+  void return_value(OpaqueHandle value) { return_value_(context_, value); }
+  auto new_table() -> Result<OpaqueHandle> { return new_table_(context_); }
+
   template <typename T>
     requires(rstd::mtp::same_as<T, i64> || rstd::mtp::same_as<T, bool> ||
              rstd::mtp::same_as<T, String> || rstd::mtp::same_as<T, Table> ||
@@ -383,6 +391,7 @@ public:
   }
   void push(Value value) { push_value_(context_, rstd::move(value)); }
   void push_nil() { push_nil_(context_); }
+  void raise(Value value) { raise_value_(context_, rstd::move(value)); }
 
 private:
   using ReadI64 = auto (*)(void *, usize) -> Result<i64>;
@@ -393,11 +402,16 @@ private:
   using ReadOpaque = auto (*)(void *, usize) -> Result<OpaqueHandle>;
   using PushValue = void (*)(void *, Value);
   using PushNil = void (*)(void *);
+  using RaiseValue = void (*)(void *, Value);
+  using ReadValue = auto (*)(void *, usize) -> Result<OpaqueHandle>;
+  using ReturnValue = void (*)(void *, OpaqueHandle);
+  using NewTable = auto (*)(void *) -> Result<OpaqueHandle>;
 
   CallFrame(void *context, usize argument_count, ReadI64 read_i64,
             ReadBool read_bool, ReadString read_string, ReadTable read_table,
             ReadArray read_array, ReadOpaque read_opaque, PushValue push_value,
-            PushNil push_nil) noexcept
+            PushNil push_nil, RaiseValue raise_value, ReadValue read_value,
+            ReturnValue return_value, NewTable new_table) noexcept
       : context_(context), argument_count_(argument_count), read_i64_(read_i64),
         read_bool_(read_bool), read_string_(read_string),
         read_table_(read_table), read_array_(read_array),
@@ -414,6 +428,10 @@ private:
   ReadOpaque read_opaque_;
   PushValue push_value_;
   PushNil push_nil_;
+  RaiseValue raise_value_;
+  ReadValue read_value_;
+  ReturnValue return_value_;
+  NewTable new_table_;
 
   friend class State;
 };
@@ -434,7 +452,8 @@ template <typename T> struct NativeReturn {
   static constexpr bool supported = NativeValue<T> ||
                                     rstd::mtp::same_as<T, Value> ||
                                     rstd::mtp::same_as<T, empty>;
-  static auto push(CallFrame &frame, T value) -> BindingResult
+  template <class Frame>
+  static auto push(Frame &frame, T value) -> BindingResult
     requires supported
   {
     if constexpr (rstd::mtp::same_as<T, empty>)
@@ -453,7 +472,8 @@ template <> struct NativeReturn<void> {
 
 template <typename T> struct NativeReturn<Option<T>> {
   static constexpr bool supported = NativeValue<T>;
-  static auto push(CallFrame &frame, Option<T> value) -> BindingResult
+  template <class Frame>
+  static auto push(Frame &frame, Option<T> value) -> BindingResult
     requires supported
   {
     if (value.is_some())
@@ -466,7 +486,8 @@ template <typename T> struct NativeReturn<Option<T>> {
 template <typename T> struct NativeReturn<Result<T>> {
   static constexpr bool supported =
       NativeReturn<T>::supported && !rstd::mtp::is_void<T>;
-  static auto push(CallFrame &frame, Result<T> value) -> BindingResult
+  template <class Frame>
+  static auto push(Frame &frame, Result<T> value) -> BindingResult
     requires supported
   {
     if (value.is_err())
@@ -486,23 +507,23 @@ template <typename R, typename... Args> struct NativeAdapter<R(Args...)> {
        ...);
   using Arguments = rstd::tuple<Option<rstd::mtp::rm_cvf<Args>>...>;
 
-  template <rstd::size_t I = 0>
-  static auto read(CallFrame &frame, Arguments &arguments) -> Result<empty> {
+  template <class Frame, rstd::size_t I = 0>
+  static auto read(Frame &frame, Arguments &arguments) -> Result<empty> {
     if constexpr (I == sizeof...(Args))
       return Ok(empty{});
     else {
       using T = rstd::mtp::rm_cvf<
           typename rstd::mtp::func_traits<R(Args...)>::template argument<I>>;
-      auto value = frame.required<T>(usize(I));
+      auto value = frame.template required<T>(usize(I));
       if (value.is_err())
         return Err(rstd::move(value).unwrap_err());
       rstd::get<I>(arguments) = Some(rstd::move(value).unwrap());
-      return read<I + 1>(frame, arguments);
+      return read<Frame, I + 1>(frame, arguments);
     }
   }
 
-  template <typename F, rstd::size_t... Is>
-  static auto call(F &function, CallFrame &frame, Arguments &arguments,
+  template <typename F, class Frame, rstd::size_t... Is>
+  static auto call(F &function, Frame &frame, Arguments &arguments,
                    rstd::mtp::index_sequence<Is...>) -> BindingResult {
     if constexpr (rstd::mtp::is_void<R>) {
       function(static_cast<Args>(rstd::move(*rstd::get<Is>(arguments)))...);

@@ -295,6 +295,7 @@ struct StateStorage {
   Option<Error> pending_module_error;
   u64 instruction_limit{}, remaining{};
   bool text_only{};
+  Option<::alloc::sync::Weak<StateStorage>> self_weak;
   unsigned hook_interval{};
   rstd::size_t memory_used{}, memory_limit{};
 
@@ -354,6 +355,18 @@ using SharedState = ::alloc::sync::Arc<StateStorage>;
 auto read_lua_value(lua_State *lua, int index, SharedState &owner)
     -> Result<LuaValue>;
 
+char storage_marker;
+
+auto storage_for_lua(lua_State *lua) -> StateStorage * {
+  auto *storage = *static_cast<StateStorage **>(lua_getextraspace(lua));
+  if (storage != nullptr)
+    return storage;
+  lua_rawgetp(lua, LUA_REGISTRYINDEX, &storage_marker);
+  storage = static_cast<StateStorage *>(lua_touserdata(lua, -1));
+  lua_pop(lua, 1);
+  return storage;
+}
+
 auto state_storage(void *owner) -> StateStorage * {
   return static_cast<SharedState *>(owner)->as_ptr().as_raw_ptr();
 }
@@ -374,7 +387,28 @@ auto reentrant_state_error() -> Error {
 struct Invocation {
   lua_State *lua;
   CallbackSlot *slot;
+  Option<Value> raised;
+  SharedState owner;
+  Vec<LuaValue> handle_returns;
+
+  static auto owner_for(lua_State *state) -> SharedState {
+    auto *storage = storage_for_lua(state);
+    if (storage->self_weak.is_some()) {
+      auto owner = storage->self_weak->upgrade();
+      if (owner)
+        return owner;
+    }
+    return SharedState::make(nullptr);
+  }
+
+  Invocation(lua_State *state, CallbackSlot *callback,
+             Option<Value> raised_value = None())
+      : lua(state), slot(callback), raised(rstd::move(raised_value)),
+        owner(owner_for(state)), handle_returns(Vec<LuaValue>::make()) {}
 };
+
+void push_lua_value(lua_State *lua, const LuaValue &value);
+auto take_lua_value(OpaqueHandle handle) -> LuaValue;
 
 struct RegistrationRequest {
   StateStorage *storage;
@@ -1260,9 +1294,41 @@ void stage_value(void *context, Value value) {
   invocation->slot->returns.push(Some(rstd::move(value)));
 }
 
+auto read_lua_argument(void *context, usize index) -> Result<OpaqueHandle> {
+  auto *invocation = static_cast<Invocation *>(context);
+  if (index >= usize(lua_gettop(invocation->lua)))
+    return Err(invocation_type_error(invocation, index, "a value"_str));
+  auto value = read_lua_value(invocation->lua,
+                              static_cast<int>(index.to_primitive() + 1),
+                              invocation->owner);
+  if (value.is_err())
+    return Err(rstd::move(value).unwrap_err());
+  return Ok(OpaqueHandle{new LuaValue(rstd::move(*value))});
+}
+
+auto new_lua_table(void *context) -> Result<OpaqueHandle> {
+  auto *invocation = static_cast<Invocation *>(context);
+  lua_createtable(invocation->lua, 0, 0);
+  auto value = read_lua_value(invocation->lua, -1, invocation->owner);
+  lua_pop(invocation->lua, 1);
+  if (value.is_err())
+    return Err(rstd::move(value).unwrap_err());
+  return Ok(OpaqueHandle{new LuaValue(rstd::move(*value))});
+}
+
+void stage_handle(void *context, OpaqueHandle handle) {
+  auto *invocation = static_cast<Invocation *>(context);
+  invocation->handle_returns.push(take_lua_value(handle));
+}
+
 void stage_nil(void *context) {
   auto *invocation = static_cast<Invocation *>(context);
   invocation->slot->returns.push(None());
+}
+
+auto raise_value(void *context, Value value) -> void {
+  auto *invocation = static_cast<Invocation *>(context);
+  invocation->raised = Some(rstd::move(value));
 }
 
 int raise_error(lua_State *state, const Error &error) {
@@ -1356,6 +1422,8 @@ auto State::create(StateOptions options) -> Result<State> {
   storage->remaining = storage->instruction_limit;
   storage->text_only = options.text_only();
   *static_cast<StateStorage **>(lua_getextraspace(lua)) = storage;
+  lua_pushlightuserdata(lua, static_cast<void *>(storage));
+  lua_rawsetp(lua, LUA_REGISTRYINDEX, &storage_marker);
   lua_atpanic(lua, +[](lua_State *) -> int { return 0; });
 
   if (!lua_checkstack(lua, 2)) {
@@ -1409,6 +1477,7 @@ auto State::create(StateOptions options) -> Result<State> {
         },
         LUA_MASKCOUNT, static_cast<int>(storage->hook_interval));
   }
+  storage->self_weak = Some(owner.downgrade());
   auto holder = Box<SharedState>::make(rstd::move(owner));
   auto raw = rstd::move(holder).into_raw().as_raw_ptr();
   return Ok(State(static_cast<void *>(raw)));
@@ -1666,8 +1735,16 @@ auto State::loaded_modules() const noexcept -> slice<LoadedModule> {
   return storage->loaded_modules.as_slice();
 }
 
+auto take_lua_value(OpaqueHandle handle) -> LuaValue {
+  auto *value = static_cast<LuaValue *>(const_cast<void *>(handle.identity));
+  auto result = rstd::move(*value);
+  delete value;
+  return result;
+}
+
 int State::dispatch(void *lua_state) {
   auto *lua = static_cast<lua_State *>(lua_state);
+  auto *storage = storage_for_lua(lua);
   auto *slot =
       static_cast<CallbackSlot *>(lua_touserdata(lua, lua_upvalueindex(1)));
   slot->pending_error = None();
@@ -1688,9 +1765,11 @@ int State::dispatch(void *lua_state) {
   usize result_count{};
   {
     auto invocation = Invocation{lua, slot};
-    auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
-                           actual, read_i64, read_bool, read_string, read_table,
-                           read_array, read_opaque, stage_value, stage_nil);
+    auto frame =
+        CallFrame(static_cast<void *>(rstd::addressof(invocation)), actual,
+                  read_i64, read_bool, read_string, read_table, read_array,
+                  read_opaque, stage_value, stage_nil, raise_value,
+                  read_lua_argument, stage_handle, new_lua_table);
     auto result = slot->callback->operator()(frame);
     if (result.is_err()) {
       auto error = rstd::move(result).unwrap_err_unchecked();
@@ -1699,6 +1778,28 @@ int State::dispatch(void *lua_state) {
       slot->pending_error = Some(rstd::move(error));
     } else {
       result_count = rstd::move(result).unwrap_unchecked();
+    }
+    if (!invocation.handle_returns.is_empty()) {
+      auto count = invocation.handle_returns.len();
+      if (!lua_checkstack(lua, static_cast<int>(count.to_primitive()))) {
+        slot->pending_error = Some(
+            Error{ErrorKind::Memory, slot->source.clone(),
+                  "Lua result stack allocation failed"_Str, String::make()});
+        return raise_pending_error(lua, slot);
+      }
+      for (const auto &value : invocation.handle_returns)
+        push_lua_value(lua, value);
+      return static_cast<int>(count.to_primitive());
+    }
+    if (invocation.raised.is_some()) {
+      auto value = rstd::move(*invocation.raised);
+      if (!push_value(lua, value)) {
+        slot->pending_error = Some(Error{
+            ErrorKind::Memory, slot->source.clone(),
+            "Lua raise value stack allocation failed"_Str, String::make()});
+        return raise_pending_error(lua, slot);
+      }
+      return lua_error(lua);
     }
   }
 
@@ -1768,6 +1869,7 @@ int async_continuation(lua_State *lua, int, lua_KContext context) {
 
 int State::dispatch_async(void *lua_state) {
   auto *lua = static_cast<lua_State *>(lua_state);
+  auto *storage = storage_for_lua(lua);
   auto *slot =
       static_cast<CallbackSlot *>(lua_touserdata(lua, lua_upvalueindex(1)));
   if (slot->pending_error.is_some())
@@ -1793,9 +1895,10 @@ int State::dispatch_async(void *lua_state) {
     return raise_pending_error(lua, slot);
   }
   Invocation invocation{lua, slot};
-  auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
-                         actual, read_i64, read_bool, read_string, read_table,
-                         read_array, read_opaque, stage_value, stage_nil);
+  auto frame = CallFrame(
+      static_cast<void *>(rstd::addressof(invocation)), actual, read_i64,
+      read_bool, read_string, read_table, read_array, read_opaque, stage_value,
+      stage_nil, raise_value, read_lua_argument, stage_handle, new_lua_table);
   auto started = (**slot->async_starter)(frame);
   if (started.is_err()) {
     auto error = rstd::move(started).unwrap_err();
