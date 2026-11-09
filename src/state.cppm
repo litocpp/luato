@@ -438,7 +438,7 @@ struct Invocation {
 };
 
 void push_lua_value(lua_State *lua, const LuaValue &value);
-auto take_lua_value(OpaqueHandle handle) -> LuaValue;
+export auto take_lua_value(OpaqueHandle handle) -> LuaValue;
 
 struct RegistrationRequest {
   StateStorage *storage;
@@ -3242,8 +3242,9 @@ auto FunctionHandle::call_async(MultiValue arguments)
     co_return Err(rstd::move(error));
   }
   auto output = MultiValue::make();
-  auto base = lua_gettop(thread) - nresults + 1;
-  for (int index = 0; index < nresults; ++index) {
+  auto total = lua_gettop(thread);
+  auto base = 1;
+  for (int index = 0; index < total; ++index) {
     auto value = read_lua_value(thread, base + index, *co_owner);
     if (value.is_err()) {
       lua_settop(lua, top);
