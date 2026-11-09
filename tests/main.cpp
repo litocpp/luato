@@ -2,6 +2,7 @@ import luato;
 
 auto expect_i18n_contract() -> int;
 auto expect_typed_contract() -> int;
+auto expect_async_contract() -> int;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
@@ -674,5 +675,8 @@ int main() {
 
   checks.expect(callback_drops == 2,
                 "state should destroy each callback context exactly once");
-  return checks.failures == 0 && expect_typed_contract() == 0 ? 0 : 1;
+  return checks.failures == 0 && expect_typed_contract() == 0 &&
+                 expect_async_contract() == 0
+             ? 0
+             : 1;
 }

@@ -4,6 +4,7 @@ module;
 export module luato:binding;
 
 export import :error;
+import rstd;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
@@ -418,6 +419,8 @@ private:
 };
 
 using NativeCallback = dyn<FnMut<BindingResult(CallFrame &)>>;
+using AsyncNativeStarter =
+    dyn<FnMut<Result<rstd::async::coro<Result<Array>>>(CallFrame &)>>;
 
 } // namespace luato
 
@@ -529,6 +532,76 @@ template <typename R, typename... Args> struct NativeAdapter<R(Args...)> {
   }
 };
 
+template <typename T> struct AsyncValue {
+  static auto make(T value) -> Value {
+    if constexpr (rstd::mtp::same_as<T, i64>)
+      return Value::Integer(value);
+    else if constexpr (rstd::mtp::same_as<T, bool>)
+      return Value::Boolean(value);
+    else if constexpr (rstd::mtp::same_as<T, String>)
+      return Value::String(rstd::move(value));
+    else if constexpr (rstd::mtp::same_as<T, Table>)
+      return Value::Table(rstd::move(value));
+    else if constexpr (rstd::mtp::same_as<T, Array>)
+      return Value::Array(rstd::move(value));
+    else if constexpr (rstd::mtp::same_as<T, Value>)
+      return rstd::move(value);
+    else
+      static_assert(!rstd::mtp::same_as<T, T>, "unsupported async return type");
+  }
+};
+
+template <typename T> struct AsyncValue<Option<T>> {
+  static auto make(Option<T> value) -> Value {
+    if (value.is_some())
+      return AsyncValue<T>::make(rstd::move(*value));
+    return Value::Nil();
+  }
+};
+
+template <typename Signature> struct NativeAsyncAdapter {};
+
+template <typename R, typename... Args> struct NativeAsyncAdapter<R(Args...)> {
+  static constexpr bool supported = NativeAdapter<R(Args...)>::supported;
+  using Arguments = rstd::tuple<Option<rstd::mtp::rm_cvf<Args>>...>;
+
+  template <typename F, typename Tuple, rstd::size_t... Is>
+  static auto run(F &function, Tuple arguments,
+                  rstd::mtp::index_sequence<Is...>)
+      -> rstd::async::coro<Result<Array>> {
+    auto result = co_await function(rstd::move(rstd::get<Is>(arguments))...);
+    if (result.is_err())
+      co_return Err(rstd::move(result).unwrap_err());
+    auto values = Vec<Value>::make();
+    if constexpr (!rstd::mtp::is_void<R>) {
+      auto value = rstd::move(result).unwrap();
+      values.push(AsyncValue<rstd::mtp::rm_cvf<R>>::make(rstd::move(value)));
+    }
+    co_return Ok(Array::from(rstd::move(values)));
+  }
+
+  template <typename F, rstd::size_t... Is>
+  static auto take(Arguments &arguments, rstd::mtp::index_sequence<Is...>)
+      -> rstd::tuple<rstd::mtp::rm_cvf<Args>...> {
+    return rstd::tuple<rstd::mtp::rm_cvf<Args>...>(
+        rstd::move(*rstd::get<Is>(arguments))...);
+  }
+
+  template <typename F> static auto wrap(F &&function) {
+    return [function = rstd::forward<F>(function)](CallFrame &frame) mutable
+               -> Result<rstd::async::coro<Result<Array>>> {
+      auto arguments = Arguments{};
+      auto loaded = NativeAdapter<R(Args...)>::read(frame, arguments);
+      if (loaded.is_err())
+        return Err(rstd::move(loaded).unwrap_err());
+      auto values =
+          take<F>(arguments, rstd::mtp::make_index_sequence<sizeof...(Args)>{});
+      return Ok(run(function, rstd::move(values),
+                    rstd::mtp::make_index_sequence<sizeof...(Args)>{}));
+    };
+  }
+};
+
 } // namespace luato
 
 export namespace luato {
@@ -579,10 +652,65 @@ private:
   friend class State;
 };
 
+template <typename T> struct AsyncReturnOf;
+template <typename R>
+struct AsyncReturnOf<rstd::async::coro<luato::Result<R>>> {
+  using type = R;
+};
+
+template <typename Signature> struct AsyncSignature;
+template <typename C, typename... Args> struct AsyncSignature<C(Args...)> {
+  using type = typename AsyncReturnOf<C>::type(Args...);
+};
+
+class AsyncNativeFunctionSpec {
+public:
+  AsyncNativeFunctionSpec(AsyncNativeFunctionSpec &&) noexcept = default;
+  AsyncNativeFunctionSpec &
+  operator=(AsyncNativeFunctionSpec &&) noexcept = default;
+
+  template <typename Signature, typename F>
+    requires NativeAsyncAdapter<Signature>::supported &&
+             requires(F &function, CallFrame &frame) {
+               {
+                 NativeAsyncAdapter<Signature>::wrap(
+                     rstd::forward<F>(function))(frame)
+               }
+               -> rstd::mtp::same_as<Result<rstd::async::coro<Result<Array>>>>;
+             }
+  static auto typed(String name, F &&function) -> AsyncNativeFunctionSpec {
+    auto wrapped =
+        NativeAsyncAdapter<Signature>::wrap(rstd::forward<F>(function));
+    return AsyncNativeFunctionSpec(
+        rstd::move(name), usize(rstd::mtp::func_traits<Signature>::arity),
+        Box<AsyncNativeStarter>::make(rstd::move(wrapped)));
+  }
+
+  template <typename F>
+    requires requires { typename rstd::mtp::func_traits<F>::signature; }
+  static auto typed(String name, F &&function) -> AsyncNativeFunctionSpec {
+    using converted = typename AsyncSignature<
+        typename rstd::mtp::func_traits<F>::signature>::type;
+    return typed<converted>(rstd::move(name), rstd::forward<F>(function));
+  }
+
+private:
+  AsyncNativeFunctionSpec(String name, usize arity,
+                          Box<AsyncNativeStarter> starter)
+      : name_(rstd::move(name)), arity_(arity), starter_(rstd::move(starter)) {}
+
+  String name_;
+  usize arity_;
+  Box<AsyncNativeStarter> starter_;
+
+  friend class State;
+};
+
 class ModuleSpec {
 public:
   explicit ModuleSpec(String name)
       : name_(rstd::move(name)), functions_(Vec<NativeFunctionSpec>::make()),
+        async_functions_(Vec<AsyncNativeFunctionSpec>::make()),
         fields_(Vec<TableEntry>::make()) {}
 
   ModuleSpec(ModuleSpec &&) noexcept = default;
@@ -610,6 +738,15 @@ public:
     add(NativeFunctionSpec::typed<Signature>(rstd::move(name),
                                              rstd::forward<F>(callable)));
   }
+
+  template <typename F>
+    requires requires(String name, F &&f) {
+      AsyncNativeFunctionSpec::typed(rstd::move(name), rstd::forward<F>(f));
+    }
+  void async_function(String name, F &&callable) {
+    async_functions_.push(AsyncNativeFunctionSpec::typed(
+        rstd::move(name), rstd::forward<F>(callable)));
+  }
   void set(String name, i64 value) {
     fields_.push(TableEntry{rstd::move(name), Value::Integer(value)});
   }
@@ -630,6 +767,7 @@ public:
 private:
   String name_;
   Vec<NativeFunctionSpec> functions_;
+  Vec<AsyncNativeFunctionSpec> async_functions_;
   Vec<TableEntry> fields_;
 
   friend class State;

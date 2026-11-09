@@ -103,6 +103,9 @@ public:
   auto call_multi(Array arguments) -> Result<Array>;
   // Arguments and results retain Lua object identity.
   auto call_values(MultiValue arguments) -> Result<MultiValue>;
+  // Runs the function inside a coroutine so async native functions can suspend.
+  auto call_async(MultiValue arguments)
+      -> rstd::async::coro<Result<MultiValue>>;
 
 private:
   explicit FunctionHandle(void *handle) noexcept : handle_(handle) {}
@@ -220,6 +223,7 @@ public:
 private:
   explicit State(void *storage) noexcept : storage_(storage) {}
   static int dispatch(void *lua_state);
+  static int dispatch_async(void *lua_state);
   auto register_module_table(ModuleSpec module, Option<String> global_name,
                              Option<String> native_identity) -> Result<empty>;
   void reset() noexcept;
@@ -235,19 +239,36 @@ private:
 
 namespace luato {
 
+struct AsyncPending {
+  rstd::async::coro<Result<Array>> task;
+  Array results;
+  Option<String> error;
+  AsyncPending(rstd::async::coro<Result<Array>> value)
+      : task(rstd::move(value)), results(Array::make()), error(None()) {}
+};
+
 struct CallbackSlot {
   String name;
   String source;
   usize arity;
   Box<NativeCallback> callback;
+  Option<Box<AsyncNativeStarter>> async_starter;
   Vec<Option<Value>> returns;
   Option<Error> pending_error;
 
   CallbackSlot(String name, String source, usize arity,
                Box<NativeCallback> callback)
       : name(rstd::move(name)), source(rstd::move(source)), arity(arity),
-        callback(rstd::move(callback)), returns(Vec<Option<Value>>::make()),
-        pending_error(None()) {}
+        callback(rstd::move(callback)), async_starter(None()),
+        returns(Vec<Option<Value>>::make()), pending_error(None()) {}
+
+  CallbackSlot(String name, String source, usize arity,
+               Box<AsyncNativeStarter> starter)
+      : name(rstd::move(name)), source(rstd::move(source)), arity(arity),
+        callback(Box<NativeCallback>::make(
+            [](CallFrame &) -> BindingResult { return Ok(usize()); })),
+        async_starter(Some(rstd::move(starter))),
+        returns(Vec<Option<Value>>::make()), pending_error(None()) {}
 };
 
 struct ModuleFrame {
@@ -364,6 +385,7 @@ struct RegistrationRequest {
   usize first_slot;
   usize slot_count;
   lua_CFunction dispatcher;
+  lua_CFunction async_dispatcher;
 };
 
 constexpr int ERROR_TAG = 1;
@@ -857,7 +879,10 @@ int register_module(lua_State *state) {
         request->storage->callbacks[request->first_slot + offset].get();
     push_string(state, slot->name);
     lua_pushlightuserdata(state, static_cast<void *>(slot));
-    lua_pushcclosure(state, request->dispatcher, 1);
+    lua_pushcclosure(state,
+                     slot->async_starter.is_some() ? request->async_dispatcher
+                                                   : request->dispatcher,
+                     1);
     lua_rawset(state, module);
   }
 
@@ -1505,6 +1530,29 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
       }
     }
   }
+  for (auto index = usize(); index < module.async_functions_.len(); ++index) {
+    auto &function = module.async_functions_[index];
+    if (function.name_.is_empty()) {
+      return Err(Error::make(ErrorKind::Binding, module.name_.clone(),
+                             "async function name cannot be empty"_Str));
+    }
+    for (auto other = usize(); other < index; ++other) {
+      if (module.async_functions_[other].name_ == function.name_.as_str()) {
+        return Err(Error::make(ErrorKind::Binding, module.name_.clone(),
+                               rstd::format("duplicate async function '{}.{}'",
+                                            module.name_.as_str(),
+                                            function.name_.as_str())));
+      }
+    }
+    for (const auto &sync : module.functions_) {
+      if (sync.name_ == function.name_.as_str()) {
+        return Err(Error::make(ErrorKind::Binding, module.name_.clone(),
+                               rstd::format("duplicate function '{}.{}'",
+                                            module.name_.as_str(),
+                                            function.name_.as_str())));
+      }
+    }
+  }
   for (auto index = usize(); index < module.fields_.len(); ++index) {
     auto &field = module.fields_[index];
     if (field.key.is_empty()) {
@@ -1527,6 +1575,14 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
                       rstd::format("duplicate module member '{}.{}'",
                                    module.name_.as_str(), field.key.as_str())));
     }
+    for (const auto &function : module.async_functions_) {
+      if (function.name_ != field.key.as_str())
+        continue;
+      return Err(
+          Error::make(ErrorKind::Binding, module.name_.clone(),
+                      rstd::format("duplicate module member '{}.{}'",
+                                   module.name_.as_str(), field.key.as_str())));
+    }
   }
 
   auto first_slot = storage->callbacks.len();
@@ -1539,8 +1595,20 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
         rstd::move(function.callback_)));
   }
 
+  for (auto index = usize(); index < module.async_functions_.len(); ++index) {
+    auto &function = module.async_functions_[index];
+    auto source =
+        rstd::format("{}.{}", module.name_.as_str(), function.name_.as_str());
+    storage->callbacks.push(Box<CallbackSlot>::make(
+        rstd::move(function.name_), rstd::move(source), function.arity_,
+        rstd::move(function.starter_)));
+  }
+
   auto dispatcher = +[](lua_State *state) -> int {
     return State::dispatch(static_cast<void *>(state));
+  };
+  auto async_dispatcher = +[](lua_State *state) -> int {
+    return State::dispatch_async(static_cast<void *>(state));
   };
   auto request = RegistrationRequest{
       storage,
@@ -1549,8 +1617,9 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
       module.fields_.data(),
       module.fields_.len(),
       first_slot,
-      module.functions_.len(),
-      dispatcher};
+      module.functions_.len() + module.async_functions_.len(),
+      dispatcher,
+      async_dispatcher};
 
   if (!lua_checkstack(lua, 2)) {
     storage->callbacks.truncate(first_slot);
@@ -1675,6 +1744,70 @@ int State::dispatch(void *lua_state) {
     return raise_pending_error(lua, slot);
   }
   return push_pending_values(lua, slot, count);
+}
+
+int async_continuation(lua_State *lua, int, lua_KContext context) {
+  auto *pending = reinterpret_cast<AsyncPending *>(context);
+  if (pending->error.is_some()) {
+    auto message = rstd::move(*pending->error);
+    delete pending;
+    push_string(lua, message);
+    return lua_error(lua);
+  }
+  int count = 0;
+  if (lua_checkstack(lua,
+                     static_cast<int>(pending->results.len().to_primitive()))) {
+    for (const auto &value : pending->results.values()) {
+      if (push_value(lua, value))
+        ++count;
+    }
+  }
+  delete pending;
+  return count;
+}
+
+int State::dispatch_async(void *lua_state) {
+  auto *lua = static_cast<lua_State *>(lua_state);
+  auto *slot =
+      static_cast<CallbackSlot *>(lua_touserdata(lua, lua_upvalueindex(1)));
+  if (slot->pending_error.is_some())
+    slot->pending_error = None();
+  auto actual = usize(lua_gettop(lua));
+  if (actual != slot->arity) {
+    slot->pending_error = Some(Error{
+        ErrorKind::Type,
+        slot->source.clone(),
+        rstd::format("{} expects {} arguments, received {}",
+                     slot->source.as_str(), slot->arity, actual),
+        String::make(),
+    });
+    return raise_pending_error(lua, slot);
+  }
+  if (!lua_isyieldable(lua)) {
+    slot->pending_error = Some(Error{
+        ErrorKind::Runtime,
+        slot->source.clone(),
+        "async Lua function requires a coroutine call context"_Str,
+        String::make(),
+    });
+    return raise_pending_error(lua, slot);
+  }
+  Invocation invocation{lua, slot};
+  auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
+                         actual, read_i64, read_bool, read_string, read_table,
+                         read_array, read_opaque, stage_value, stage_nil);
+  auto started = (**slot->async_starter)(frame);
+  if (started.is_err()) {
+    auto error = rstd::move(started).unwrap_err();
+    if (error.source.is_empty())
+      error.source = slot->source.clone();
+    slot->pending_error = Some(rstd::move(error));
+    return raise_pending_error(lua, slot);
+  }
+  auto *pending = new AsyncPending(rstd::move(started).unwrap());
+  lua_pushlightuserdata(lua, static_cast<void *>(pending));
+  return lua_yieldk(lua, 1, reinterpret_cast<lua_KContext>(pending),
+                    async_continuation);
 }
 
 auto State::execute_entry(LuaModuleSource source) -> Result<ExecutionReport> {
@@ -2653,6 +2786,78 @@ auto FunctionHandle::call_multi(Array arguments) -> Result<Array> {
   if (request.error)
     return Err(rstd::move(*request.error));
   return Ok(Array::from(rstd::move(request.output)));
+}
+
+auto FunctionHandle::call_async(MultiValue arguments)
+    -> rstd::async::coro<Result<MultiValue>> {
+  if (!handle_)
+    co_return Err(Error::binding("Lua function handle was moved"_Str));
+  if (arguments.len() > usize(64))
+    co_return Err(Error::binding("too many Lua arguments"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    co_return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    co_return Err(reentrant_state_error());
+  for (const auto &value : arguments.values()) {
+    auto valid = validate_lua_value(value, owner);
+    if (valid.is_err())
+      co_return Err(rstd::move(valid).unwrap_err());
+  }
+  ExecutionGuard guard(*storage);
+  auto *lua = storage->lua;
+  auto top = lua_gettop(lua);
+  auto *thread = lua_newthread(lua);
+  if (thread == nullptr || !lua_checkstack(thread, 8)) {
+    lua_settop(lua, top);
+    co_return Err(Error::binding("Lua call stack allocation failed"_Str));
+  }
+  auto *co_owner = rstd::addressof(owner);
+  lua_rawgeti(thread, LUA_REGISTRYINDEX, handle.reference);
+  for (const auto &value : arguments.values()) {
+    push_lua_value(thread, value);
+  }
+  int nresults = 0;
+  int status = lua_resume(
+      thread, lua, static_cast<int>(arguments.len().to_primitive()), &nresults);
+  while (status == LUA_YIELD) {
+    if (lua_gettop(thread) < 1 || !lua_islightuserdata(thread, -1)) {
+      lua_settop(lua, top);
+      co_return Err(
+          Error::binding("Lua async function yielded an invalid value"_Str));
+    }
+    auto *pending = static_cast<AsyncPending *>(lua_touserdata(thread, -1));
+    lua_pop(thread, 1);
+    auto outcome = co_await rstd::move(pending->task);
+    if (outcome.is_err()) {
+      auto error = rstd::move(outcome).unwrap_err();
+      pending->error = Some(error.message.clone());
+    } else {
+      pending->results = rstd::move(*outcome);
+    }
+    status = lua_resume(thread, lua, 0, &nresults);
+  }
+  if (status != LUA_OK) {
+    auto error = error_from_top(
+        thread, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "function"_Str);
+    lua_settop(lua, top);
+    co_return Err(rstd::move(error));
+  }
+  auto output = MultiValue::make();
+  auto base = lua_gettop(thread) - nresults + 1;
+  for (int index = 0; index < nresults; ++index) {
+    auto value = read_lua_value(thread, base + index, *co_owner);
+    if (value.is_err()) {
+      lua_settop(lua, top);
+      co_return Err(rstd::move(value).unwrap_err());
+    }
+    output.push(rstd::move(*value));
+  }
+  lua_settop(lua, top);
+  co_return Ok(rstd::move(output));
 }
 
 struct DynamicCallRequest {
