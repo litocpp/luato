@@ -802,6 +802,12 @@ public:
     async_functions_.push(AsyncNativeFunctionSpec::typed(
         rstd::move(name), rstd::forward<F>(callable)));
   }
+
+  template <typename Callable>
+  void async_handle_function(String name, usize arity, Callable &&callable) {
+    async_handle_functions_.push(AsyncNativeHandleFunctionSpec::make(
+        rstd::move(name), arity, rstd::forward<Callable>(callable)));
+  }
   void set(String name, i64 value) {
     fields_.push(TableEntry{rstd::move(name), Value::Integer(value)});
   }
