@@ -392,6 +392,7 @@ public:
   void push(Value value) { push_value_(context_, rstd::move(value)); }
   void push_nil() { push_nil_(context_); }
   void raise(Value value) { raise_value_(context_, rstd::move(value)); }
+  void raise_handle(OpaqueHandle value) { raise_handle_(context_, value); }
 
 private:
   using ReadI64 = auto (*)(void *, usize) -> Result<i64>;
@@ -406,12 +407,14 @@ private:
   using ReadValue = auto (*)(void *, usize) -> Result<OpaqueHandle>;
   using ReturnValue = void (*)(void *, OpaqueHandle);
   using NewTable = auto (*)(void *) -> Result<OpaqueHandle>;
+  using RaiseHandle = void (*)(void *, OpaqueHandle);
 
   CallFrame(void *context, usize argument_count, ReadI64 read_i64,
             ReadBool read_bool, ReadString read_string, ReadTable read_table,
             ReadArray read_array, ReadOpaque read_opaque, PushValue push_value,
             PushNil push_nil, RaiseValue raise_value, ReadValue read_value,
-            ReturnValue return_value, NewTable new_table) noexcept
+            ReturnValue return_value, NewTable new_table,
+            RaiseHandle raise_handle) noexcept
       : context_(context), argument_count_(argument_count), read_i64_(read_i64),
         read_bool_(read_bool), read_string_(read_string),
         read_table_(read_table), read_array_(read_array),
@@ -432,6 +435,7 @@ private:
   ReadValue read_value_;
   ReturnValue return_value_;
   NewTable new_table_;
+  RaiseHandle raise_handle_;
 
   friend class State;
 };
