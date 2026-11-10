@@ -418,8 +418,10 @@ private:
       : context_(context), argument_count_(argument_count), read_i64_(read_i64),
         read_bool_(read_bool), read_string_(read_string),
         read_table_(read_table), read_array_(read_array),
-        read_opaque_(read_opaque), push_value_(push_value),
-        push_nil_(push_nil) {}
+        read_opaque_(read_opaque), push_value_(push_value), push_nil_(push_nil),
+        raise_value_(raise_value), read_value_(read_value),
+        return_value_(return_value), new_table_(new_table),
+        raise_handle_(raise_handle) {}
 
   void *context_;
   usize argument_count_;

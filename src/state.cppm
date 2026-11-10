@@ -945,8 +945,11 @@ int register_module(lua_State *state) {
     push_string(state, slot->name);
     lua_pushlightuserdata(state, static_cast<void *>(slot));
     lua_pushcclosure(state,
-                     slot->async_starter.is_some() ? request->async_dispatcher
-                                                   : request->dispatcher,
+                     slot->async_starter.is_some()
+                         ? request->async_dispatcher
+                         : (slot->async_handle_starter.is_some()
+                                ? request->async_handle_dispatcher
+                                : request->dispatcher),
                      1);
     lua_rawset(state, module);
   }
@@ -1945,8 +1948,13 @@ int async_continuation(lua_State *lua, int, lua_KContext context) {
     return lua_error(lua);
   }
   int count = 0;
-  if (lua_checkstack(lua,
-                     static_cast<int>(pending->results.len().to_primitive()))) {
+  if (pending->kind == AsyncPending::Kind::Handle) {
+    if (pending->handle_result.is_some() && lua_checkstack(lua, 1)) {
+      push_lua_value(lua, *pending->handle_result);
+      count = 1;
+    }
+  } else if (lua_checkstack(lua, static_cast<int>(
+                                     pending->results.len().to_primitive()))) {
     for (const auto &value : pending->results.values()) {
       if (push_value(lua, value))
         ++count;

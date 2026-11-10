@@ -72,5 +72,49 @@ auto expect_async_contract() -> int {
 
   auto sync = function->call_values(make_arguments());
   checks.expect(sync.is_err(), "sync call of async function fails");
+  auto handle_module = luato::ModuleSpec(String::make("host_handle"_Str));
+  handle_module.async_handle_function(
+      String::make("fetch"_Str), usize(0),
+      [](luato::CallFrame &frame)
+          -> luato::Result<
+              rstd::async::coro<luato::Result<luato::OpaqueHandle>>> {
+        auto created = frame.new_table();
+        if (created.is_err())
+          return Err(rstd::move(created).unwrap_err());
+        auto value = luato::take_lua_value(*created);
+        auto table = rstd::move(value).as_Table().value;
+        return Ok([](luato::TableHandle target)
+                      -> rstd::async::coro<luato::Result<luato::OpaqueHandle>> {
+          co_await rstd::async::sleep(
+              rstd::time::Duration::from_millis(u64(1)));
+          (void)target.set(
+              luato::LuaValue::Bytes(Vec<u8>::from("x"_str.as_bytes())),
+              luato::LuaValue::Integer(i64(9)));
+          co_return Ok(luato::OpaqueHandle{
+              new luato::LuaValue(luato::LuaValue::Table(rstd::move(target)))});
+        }(rstd::move(table)));
+      });
+  checks.expect(state.register_module(rstd::move(handle_module)).is_ok(),
+                "register async handle module");
+  auto handle_globals = state.globals();
+  if (handle_globals.is_ok()) {
+    auto handle_table = handle_globals->get_table("host_handle"_Str);
+    checks.expect(handle_table.is_ok(), "async handle module table");
+    if (handle_table.is_ok()) {
+      auto fetch = handle_table->get_function("fetch"_Str);
+      checks.expect(fetch.is_ok(), "async handle function");
+      if (fetch.is_ok()) {
+        auto result = runtime->block_on(rstd::async::into_future(
+            fetch->call_async(luato::MultiValue::make())));
+        checks.expect(result.is_ok(), "async handle call");
+        if (result.is_ok()) {
+          auto values = rstd::move(*result).into_values();
+          checks.expect(values.len() == usize(1) && values[usize()].is_Table(),
+                        "async handle result");
+        }
+      }
+    }
+  }
+
   return checks.failures;
 }
