@@ -128,6 +128,7 @@ public:
   auto get_table(ref<str> name) -> Result<TableHandle>;
   auto raw_get_table(ref<str> name) -> Result<TableHandle>;
   auto same_object(const TableHandle &other) const -> Result<bool>;
+  auto same_object_in_call(const TableHandle &other) const -> Result<bool>;
   auto get_value(ref<str> name) -> Result<LuaValue>;
   auto raw_get_value(ref<str> name) -> Result<LuaValue>;
   auto get(const LuaValue &key) -> Result<LuaValue>;
@@ -136,6 +137,8 @@ public:
   auto length() -> Result<usize>;
   auto keys() -> Result<Vec<LuaValue>>;
   auto to_table() -> Result<Table>;
+  auto get_in_call(const LuaValue &key) -> Result<LuaValue>;
+  auto set_in_call(const LuaValue &key, const LuaValue &value) -> Result<empty>;
   auto to_value() -> Result<Value>;
   auto raw_set(const LuaValue &key, const LuaValue &value) -> Result<empty>;
 
@@ -2920,6 +2923,43 @@ auto TableHandle::to_value() -> Result<Value> {
   return value;
 }
 
+auto TableHandle::get_in_call(const LuaValue &key) -> Result<LuaValue> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *lua = owner.as_ptr().as_raw_ptr()->lua;
+  auto top = lua_gettop(lua);
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, handle.reference);
+  push_lua_value(lua, key);
+  lua_rawget(lua, -2);
+  auto value = read_lua_value(lua, -1, owner);
+  lua_settop(lua, top);
+  if (value.is_err())
+    return Err(rstd::move(value).unwrap_err());
+  return Ok(rstd::move(*value));
+}
+
+auto TableHandle::set_in_call(const LuaValue &key, const LuaValue &value)
+    -> Result<empty> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *lua = owner.as_ptr().as_raw_ptr()->lua;
+  auto top = lua_gettop(lua);
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, handle.reference);
+  push_lua_value(lua, key);
+  push_lua_value(lua, value);
+  lua_rawset(lua, -3);
+  lua_settop(lua, top);
+  return Ok(empty{});
+}
+
 auto TableHandle::get_function(ref<str> name) -> Result<FunctionHandle> {
   return get_function_impl(name, false);
 }
@@ -3106,6 +3146,33 @@ auto same_registry_object(void *left_handle, void *right_handle)
   auto equal = lua_rawequal(lua, -1, -2) != 0;
   lua_pop(lua, 2);
   return Ok(equal);
+}
+
+auto same_registry_object_in_call(void *left_handle, void *right_handle)
+    -> Result<bool> {
+  if (!left_handle || !right_handle)
+    return Err(Error::binding("Lua object handle was moved"_Str));
+  auto &left = *registry_handle(left_handle);
+  auto &right = *registry_handle(right_handle);
+  auto owner = left.owner.upgrade();
+  auto other_owner = right.owner.upgrade();
+  if (!owner || !other_owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  if (!SharedState::ptr_eq(owner, other_owner))
+    return Err(Error::binding("Lua handles belong to different states"_Str));
+  auto *lua = owner.as_ptr().as_raw_ptr()->lua;
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua comparison stack allocation failed"_Str));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, left.reference);
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, right.reference);
+  auto equal = lua_rawequal(lua, -1, -2) != 0;
+  lua_pop(lua, 2);
+  return Ok(equal);
+}
+
+auto TableHandle::same_object_in_call(const TableHandle &other) const
+    -> Result<bool> {
+  return same_registry_object_in_call(handle_, other.handle_);
 }
 
 auto TableHandle::same_object(const TableHandle &other) const -> Result<bool> {

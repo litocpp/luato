@@ -777,6 +777,12 @@ public:
     functions_.push(rstd::move(function));
   }
 
+  template <typename Callback>
+  void raw_function(String name, usize arity, Callback &&callback) {
+    add(NativeFunctionSpec::make(rstd::move(name), arity,
+                                 rstd::forward<Callback>(callback)));
+  }
+
   template <typename F>
     requires requires(String name, F &&f) {
       NativeFunctionSpec::typed(rstd::move(name), rstd::forward<F>(f));
