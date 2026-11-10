@@ -136,6 +136,7 @@ public:
   auto length() -> Result<usize>;
   auto keys() -> Result<Vec<LuaValue>>;
   auto to_table() -> Result<Table>;
+  auto to_value() -> Result<Value>;
   auto raw_set(const LuaValue &key, const LuaValue &value) -> Result<empty>;
 
 private:
@@ -2902,6 +2903,21 @@ auto TableHandle::to_table() -> Result<Table> {
     return Err(Error::binding("Lua value is not a table"_Str));
   auto table = rstd::move(*value).as_Table();
   return Ok(rstd::move(*table.value));
+}
+
+auto TableHandle::to_value() -> Result<Value> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *lua = owner.as_ptr().as_raw_ptr()->lua;
+  auto top = lua_gettop(lua);
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, handle.reference);
+  auto value = snapshot_lua_value(lua, -1, owner, usize());
+  lua_settop(lua, top);
+  return value;
 }
 
 auto TableHandle::get_function(ref<str> name) -> Result<FunctionHandle> {
