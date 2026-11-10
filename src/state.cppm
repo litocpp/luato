@@ -628,10 +628,34 @@ auto error_field(lua_State *state, int object, int field, ref<str> fallback)
   return result;
 }
 
+auto named_error_field(lua_State *state, int object, const char *name) -> String {
+  lua_getfield(state, object, name);
+  auto result = copied_lua_string(state, -1, ""_str);
+  lua_pop(state, 1);
+  return result;
+}
+
 auto error_from_top(lua_State *state, ErrorKind default_kind,
                     String default_source) -> Error {
   auto object = lua_absindex(state, -1);
   if (!is_luato_error(state, object)) {
+    if (lua_istable(state, object)) {
+      auto message = named_error_field(state, object, "message");
+      auto code = named_error_field(state, object, "code");
+      if (! code.is_empty()) {
+        auto combined = String::make(code.as_str());
+        if (! message.is_empty()) {
+          combined.push_str(": "_str);
+          combined.push_str(message.as_str());
+        }
+        message = rstd::move(combined);
+      }
+      auto traceback = named_error_field(state, object, "traceback");
+      if (message.is_empty())
+        message = copied_lua_string(state, object, "unknown Lua error"_str);
+      return {default_kind, rstd::move(default_source), rstd::move(message),
+              rstd::move(traceback)};
+    }
     return {default_kind, rstd::move(default_source),
             copied_lua_string(state, object, "unknown Lua error"_str),
             String::make()};
