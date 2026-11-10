@@ -1846,7 +1846,7 @@ int State::dispatch(void *lua_state) {
   slot->returns.clear();
 
   auto actual = usize(lua_gettop(lua));
-  if (actual != slot->arity) {
+  if (slot->arity != variadic_arity && actual != slot->arity) {
     slot->pending_error = Some(Error{
         ErrorKind::Type,
         slot->source.clone(),
@@ -1980,7 +1980,7 @@ int State::dispatch_async(void *lua_state) {
   if (slot->pending_error.is_some())
     slot->pending_error = None();
   auto actual = usize(lua_gettop(lua));
-  if (actual != slot->arity) {
+  if (slot->arity != variadic_arity && actual != slot->arity) {
     slot->pending_error = Some(Error{
         ErrorKind::Type,
         slot->source.clone(),
@@ -2028,7 +2028,7 @@ int State::dispatch_async_handle(void *lua_state) {
   if (slot->pending_error.is_some())
     slot->pending_error = None();
   auto actual = usize(lua_gettop(lua));
-  if (actual != slot->arity) {
+  if (slot->arity != variadic_arity && actual != slot->arity) {
     slot->pending_error =
         Some(Error{ErrorKind::Type, slot->source.clone(),
                    rstd::format("{} expects {} arguments, received {}",

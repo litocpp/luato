@@ -442,6 +442,8 @@ private:
   friend class State;
 };
 
+inline constexpr auto variadic_arity = usize(18446744073709551615ULL);
+
 using NativeCallback = dyn<FnMut<BindingResult(CallFrame &)>>;
 using AsyncNativeStarter =
     dyn<FnMut<Result<rstd::async::coro<Result<Array>>>(CallFrame &)>>;
@@ -780,6 +782,12 @@ public:
   template <typename Callback>
   void raw_function(String name, usize arity, Callback &&callback) {
     add(NativeFunctionSpec::make(rstd::move(name), arity,
+                                 rstd::forward<Callback>(callback)));
+  }
+
+  template <typename Callback>
+  void raw_variadic_function(String name, Callback &&callback) {
+    add(NativeFunctionSpec::make(rstd::move(name), variadic_arity,
                                  rstd::forward<Callback>(callback)));
   }
 
