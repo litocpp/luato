@@ -18,12 +18,14 @@ enum class StandardLibrary {
   Base,
   String,
   Table,
+  Math,
+  Utf8,
 };
 
 struct StateOptions {
   static constexpr auto restricted(u64 instructions = u64(1000000)) noexcept
       -> StateOptions {
-    return StateOptions(true, true, true, true, instructions);
+    return StateOptions(true, true, true, true, true, true, instructions);
   }
   constexpr auto is_restricted() const noexcept -> bool { return restricted_; }
   constexpr auto instruction_limit() const noexcept -> u64 {
@@ -44,13 +46,13 @@ struct StateOptions {
   }
   constexpr auto text_only() const noexcept -> bool { return text_only_; }
   static constexpr auto none() noexcept -> StateOptions {
-    return StateOptions(false, false, false);
+    return StateOptions(false, false, false, false, false);
   }
   static constexpr auto base() noexcept -> StateOptions {
-    return StateOptions(true, false, false);
+    return StateOptions(true, false, false, false, false);
   }
   static constexpr auto build_script() noexcept -> StateOptions {
-    return StateOptions(true, true, true);
+    return StateOptions(true, true, true, true, true);
   }
 
   constexpr auto contains(StandardLibrary library) const noexcept -> bool {
@@ -61,21 +63,29 @@ struct StateOptions {
       return open_string_;
     case StandardLibrary::Table:
       return open_table_;
+    case StandardLibrary::Math:
+      return open_math_;
+    case StandardLibrary::Utf8:
+      return open_utf8_;
     }
     return false;
   }
 
 private:
   constexpr explicit StateOptions(bool open_base, bool open_string,
-                                  bool open_table, bool restricted = false,
+                                  bool open_table, bool open_math,
+                                  bool open_utf8, bool restricted = false,
                                   u64 instructions = u64()) noexcept
       : open_base_(open_base), open_string_(open_string),
-        open_table_(open_table), restricted_(restricted),
+        open_table_(open_table), open_math_(open_math),
+        open_utf8_(open_utf8), restricted_(restricted),
         text_only_(restricted), instructions_(instructions) {}
 
   bool open_base_;
   bool open_string_;
   bool open_table_;
+  bool open_math_;
+  bool open_utf8_;
   bool restricted_;
   bool text_only_;
   u64 instructions_;
@@ -1485,6 +1495,10 @@ auto State::create(StateOptions options) -> Result<State> {
     libraries |= LUA_STRLIBK;
   if (options.contains(StandardLibrary::Table))
     libraries |= LUA_TABLIBK;
+  if (options.contains(StandardLibrary::Math))
+    libraries |= LUA_MATHLIBK;
+  if (options.contains(StandardLibrary::Utf8))
+    libraries |= LUA_UTF8LIBK;
   lua_pushinteger(lua, static_cast<lua_Integer>(libraries));
   auto status = lua_pcall(lua, 1, 0, 0);
   if (status != LUA_OK) {
