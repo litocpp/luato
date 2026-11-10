@@ -106,8 +106,12 @@ public:
   // Runs the function inside a coroutine so async native functions can suspend.
   auto call_async(MultiValue arguments)
       -> rstd::async::coro<Result<MultiValue>>;
+  auto call_async_nested(MultiValue arguments)
+      -> rstd::async::coro<Result<MultiValue>>;
 
 private:
+  auto call_async_impl(MultiValue arguments, bool nested)
+      -> rstd::async::coro<Result<MultiValue>>;
   explicit FunctionHandle(void *handle) noexcept : handle_(handle) {}
   void reset() noexcept;
   void *handle_;
@@ -3266,6 +3270,16 @@ auto FunctionHandle::call_multi(Array arguments) -> Result<Array> {
 
 auto FunctionHandle::call_async(MultiValue arguments)
     -> rstd::async::coro<Result<MultiValue>> {
+  return call_async_impl(rstd::move(arguments), false);
+}
+
+auto FunctionHandle::call_async_nested(MultiValue arguments)
+    -> rstd::async::coro<Result<MultiValue>> {
+  return call_async_impl(rstd::move(arguments), true);
+}
+
+auto FunctionHandle::call_async_impl(MultiValue arguments, bool nested)
+    -> rstd::async::coro<Result<MultiValue>> {
   if (!handle_)
     co_return Err(Error::binding("Lua function handle was moved"_Str));
   if (arguments.len() > usize(64))
@@ -3275,14 +3289,16 @@ auto FunctionHandle::call_async(MultiValue arguments)
   if (!owner)
     co_return Err(Error::binding("Lua state was destroyed"_Str));
   auto *storage = owner.as_ptr().as_raw_ptr();
-  if (storage->executing)
+  if (storage->executing && !nested)
     co_return Err(reentrant_state_error());
   for (const auto &value : arguments.values()) {
     auto valid = validate_lua_value(value, owner);
     if (valid.is_err())
       co_return Err(rstd::move(valid).unwrap_err());
   }
-  ExecutionGuard guard(*storage);
+  Option<ExecutionGuard> guard;
+  if (!nested)
+    guard = Some(ExecutionGuard(*storage));
   auto *lua = storage->lua;
   auto top = lua_gettop(lua);
   auto *thread = lua_newthread(lua);
