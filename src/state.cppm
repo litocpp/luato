@@ -113,14 +113,16 @@ public:
   auto call_multi(Array arguments) -> Result<Array>;
   // Arguments and results retain Lua object identity.
   auto call_values(MultiValue arguments) -> Result<MultiValue>;
-  // Runs the function inside a coroutine so async native functions can suspend.
+  // Distinct handles may overlap on one thread while async calls are suspended.
+  // Destroying a suspended call closes its Lua coroutine.
   auto call_async(MultiValue arguments)
       -> rstd::async::coro<Result<MultiValue>>;
   auto call_async_nested(MultiValue arguments)
       -> rstd::async::coro<Result<MultiValue>>;
 
 private:
-  auto call_async_impl(MultiValue arguments, bool nested)
+  static auto call_async_impl(FunctionHandle handle, MultiValue arguments,
+                              bool nested)
       -> rstd::async::coro<Result<MultiValue>>;
   explicit FunctionHandle(void *handle) noexcept : handle_(handle) {}
   void reset() noexcept;
@@ -148,6 +150,10 @@ public:
   auto get(const LuaValue &key) -> Result<LuaValue>;
   auto raw_get(const LuaValue &key) -> Result<LuaValue>;
   auto set(const LuaValue &key, const LuaValue &value) -> Result<empty>;
+  auto metatable() -> Result<Option<TableHandle>>;
+  auto metatable_in_call() -> Result<Option<TableHandle>>;
+  auto set_metatable(const TableHandle *value) -> Result<empty>;
+  auto set_metatable_in_call(const TableHandle *value) -> Result<empty>;
   auto length() -> Result<usize>;
   auto keys() -> Result<Vec<LuaValue>>;
   auto to_table() -> Result<Table>;
@@ -163,6 +169,8 @@ private:
   auto get_table_impl(ref<str> name, bool raw) -> Result<TableHandle>;
   auto get_value_impl(ref<str> name, bool raw) -> Result<LuaValue>;
   auto get_impl(const LuaValue &key, bool raw) -> Result<LuaValue>;
+  auto metatable_impl(bool in_call) -> Result<Option<TableHandle>>;
+  auto set_metatable_impl(const TableHandle *value, bool in_call) -> Result<empty>;
   auto set_impl(const LuaValue &key, const LuaValue &value, bool raw)
       -> Result<empty>;
   void *handle_;
@@ -268,7 +276,10 @@ struct AsyncPending {
   Option<rstd::async::coro<Result<OpaqueHandle>>> handle;
   Array results;
   Option<LuaValue> handle_result;
-  Option<String> error;
+  Option<Error> error;
+  lua_State *thread{};
+  unsigned references{1};
+  bool active{true};
   static auto values_task(rstd::async::coro<Result<Array>> value)
       -> AsyncPending {
     AsyncPending pending{Kind::Values, Some(rstd::move(value)),
@@ -282,6 +293,11 @@ struct AsyncPending {
                          Array::make(), None(), None()};
     return pending;
   }
+  void retain() { ++references; }
+  void release() {
+    if (--references == 0)
+      delete this;
+  }
 };
 
 struct CallbackSlot {
@@ -292,6 +308,9 @@ struct CallbackSlot {
   Option<Box<AsyncNativeStarter>> async_starter;
   Option<Box<AsyncHandleStarter>> async_handle_starter;
   Vec<Option<Value>> returns;
+  Vec<LuaValue> handle_returns = Vec<LuaValue>::make();
+  Option<LuaValue> raised_handle;
+  Option<Value> raised_value;
   Option<Error> pending_error;
 
   CallbackSlot(String name, String source, usize arity,
@@ -334,6 +353,7 @@ struct StateStorage {
   lua_State *lua;
   bool executing{};
   Vec<Box<CallbackSlot>> callbacks;
+  Vec<AsyncPending *> pending;
   Vec<String> modules;
   Vec<NativeRequireModule> native_require_modules;
   Option<Box<ModuleResolver>> module_resolver;
@@ -348,7 +368,7 @@ struct StateStorage {
 
   explicit StateStorage(lua_State *state)
       : lua(state), callbacks(Vec<Box<CallbackSlot>>::make()),
-        modules(Vec<String>::make()),
+        pending(Vec<AsyncPending *>::make()), modules(Vec<String>::make()),
         native_require_modules(Vec<NativeRequireModule>::make()),
         module_resolver(None()), module_stack(Vec<ModuleFrame>::make()),
         loaded_modules(Vec<LoadedModule>::make()),
@@ -357,6 +377,27 @@ struct StateStorage {
   ~StateStorage() {
     if (lua != nullptr)
       lua_close(lua);
+    while (!pending.is_empty()) {
+      auto *entry = pending.pop().unwrap();
+      entry->active = false;
+      entry->release();
+    }
+  }
+  auto has_pending(AsyncPending *entry) const -> bool {
+    for (auto *candidate : pending.as_slice())
+      if (candidate == entry)
+        return true;
+    return false;
+  }
+  void finish_pending(AsyncPending *entry) {
+    for (usize index{}; index < pending.len(); ++index) {
+      if (pending[index] == entry) {
+        (void)pending.remove(index);
+        entry->active = false;
+        entry->release();
+        return;
+      }
+    }
   }
 };
 
@@ -426,6 +467,81 @@ struct ExecutionGuard {
   }
   ~ExecutionGuard() { storage.executing = false; }
 };
+
+struct AsyncExecutionGuard {
+  StateStorage &storage;
+  u64 &remaining;
+  u64 previous_remaining;
+  bool previous_executing;
+  AsyncExecutionGuard(StateStorage &value, u64 &budget)
+      : storage(value), remaining(budget), previous_remaining(value.remaining),
+        previous_executing(value.executing) {
+    storage.executing = true;
+    storage.remaining = remaining;
+  }
+  ~AsyncExecutionGuard() {
+    remaining = storage.remaining;
+    storage.remaining = previous_executing ? remaining : previous_remaining;
+    storage.executing = previous_executing;
+  }
+};
+
+struct AsyncPendingGuard {
+  // The Lua continuation and the suspended C++ frame each own a reference.
+  StateStorage &storage;
+  AsyncPending *pending;
+  AsyncPendingGuard(StateStorage &value, AsyncPending *entry)
+      : storage(value), pending(entry) {
+    pending->retain();
+  }
+  ~AsyncPendingGuard() {
+    if (pending->active)
+      storage.finish_pending(pending);
+    pending->release();
+  }
+};
+
+struct AsyncThreadGuard {
+  StateStorage &storage;
+  lua_State *thread;
+  int reference;
+  u64 &remaining;
+  bool finished{};
+  ~AsyncThreadGuard() {
+    if (!finished) {
+      AsyncExecutionGuard execution(storage, remaining);
+      (void)lua_resetthread(thread);
+    }
+    luaL_unref(storage.lua, LUA_REGISTRYINDEX, reference);
+  }
+};
+
+struct AsyncThreadCreation {
+  lua_State *thread{};
+  int reference{LUA_NOREF};
+  int function_reference{};
+  const MultiValue *arguments{};
+};
+
+void push_lua_value(lua_State *lua, const LuaValue &value);
+
+int create_async_thread(lua_State *lua) {
+  auto *request = static_cast<AsyncThreadCreation *>(lua_touserdata(lua, 1));
+  auto *thread = lua_newthread(lua);
+  if (!thread ||
+      !lua_checkstack(
+          thread,
+          static_cast<int>(request->arguments->len().to_primitive()) + 8)) {
+    lua_pop(lua, 1);
+    return 0;
+  }
+  lua_rawgeti(thread, LUA_REGISTRYINDEX, request->function_reference);
+  for (const auto &value : request->arguments->values())
+    push_lua_value(thread, value);
+  request->reference = luaL_ref(lua, LUA_REGISTRYINDEX);
+  request->thread = thread;
+  return 0;
+}
 
 auto reentrant_state_error() -> Error {
   return Error::binding("Lua state is already executing"_Str);
@@ -629,7 +745,8 @@ auto error_field(lua_State *state, int object, int field, ref<str> fallback)
 }
 
 auto named_error_field(lua_State *state, int object, const char *name) -> String {
-  lua_getfield(state, object, name);
+  lua_pushstring(state, name);
+  lua_rawget(state, object);
   auto result = copied_lua_string(state, -1, ""_str);
   lua_pop(state, 1);
   return result;
@@ -653,8 +770,12 @@ auto error_from_top(lua_State *state, ErrorKind default_kind,
       auto traceback = named_error_field(state, object, "traceback");
       if (message.is_empty())
         message = copied_lua_string(state, object, "unknown Lua error"_str);
-      return {default_kind, rstd::move(default_source), rstd::move(message),
-              rstd::move(traceback)};
+      auto domain = named_error_field(state, object, "domain");
+      Error result{default_kind, rstd::move(default_source), rstd::move(message),
+                   rstd::move(traceback)};
+      if (!domain.is_empty() || !code.is_empty())
+        result.details = Some(ErrorDetails{rstd::move(domain), rstd::move(code)});
+      return result;
     }
     return {default_kind, rstd::move(default_source),
             copied_lua_string(state, object, "unknown Lua error"_str),
@@ -674,7 +795,12 @@ auto error_from_top(lua_State *state, ErrorKind default_kind,
   auto message =
       error_field(state, object, ERROR_MESSAGE, "unknown Lua error"_str);
   auto traceback = error_field(state, object, ERROR_TRACEBACK, ""_str);
-  return {kind, rstd::move(source), rstd::move(message), rstd::move(traceback)};
+  auto domain = named_error_field(state, object, "domain");
+  auto code = named_error_field(state, object, "code");
+  Error result{kind, rstd::move(source), rstd::move(message), rstd::move(traceback)};
+  if (!domain.is_empty() || !code.is_empty())
+    result.details = Some(ErrorDetails{rstd::move(domain), rstd::move(code)});
+  return result;
 }
 
 int traceback_handler(lua_State *state) {
@@ -686,6 +812,14 @@ int traceback_handler(lua_State *state) {
       message = "unknown Lua error";
     luaL_traceback(state, state, message, 1);
     lua_rawseti(state, 1, ERROR_TRACEBACK);
+    lua_settop(state, 1);
+    return 1;
+  }
+
+  if (lua_istable(state, 1)) {
+    lua_pushliteral(state, "traceback");
+    luaL_traceback(state, state, "Lua error", 1);
+    lua_rawset(state, 1);
     lua_settop(state, 1);
     return 1;
   }
@@ -1412,8 +1546,8 @@ auto raise_value(void *context, Value value) -> void {
   invocation->raised = Some(rstd::move(value));
 }
 
-int raise_error(lua_State *state, const Error &error) {
-  lua_createtable(state, 5, 0);
+void push_error(lua_State *state, const Error &error) {
+  lua_createtable(state, 5, 3);
   auto object = lua_gettop(state);
   lua_pushlightuserdata(state, static_cast<void *>(&error_marker));
   lua_rawseti(state, object, ERROR_TAG);
@@ -1425,6 +1559,18 @@ int raise_error(lua_State *state, const Error &error) {
   lua_rawseti(state, object, ERROR_MESSAGE);
   push_string(state, error.traceback);
   lua_rawseti(state, object, ERROR_TRACEBACK);
+  if (error.details.is_some()) {
+    push_string(state, error.details->domain);
+    lua_setfield(state, object, "domain");
+    push_string(state, error.details->code);
+    lua_setfield(state, object, "code");
+    push_string(state, error.message);
+    lua_setfield(state, object, "message");
+  }
+}
+
+int raise_error(lua_State *state, const Error &error) {
+  push_error(state, error);
   return lua_error(state);
 }
 
@@ -1457,6 +1603,9 @@ void clear_callback_transients(StateStorage *storage) {
     auto *slot = storage->callbacks[index].get();
     slot->pending_error = None();
     slot->returns.clear();
+    slot->handle_returns.clear();
+    slot->raised_handle = None();
+    slot->raised_value = None();
   }
 }
 
@@ -1882,6 +2031,9 @@ int State::dispatch(void *lua_state) {
       static_cast<CallbackSlot *>(lua_touserdata(lua, lua_upvalueindex(1)));
   slot->pending_error = None();
   slot->returns.clear();
+  slot->handle_returns.clear();
+  slot->raised_handle = None();
+  slot->raised_value = None();
 
   auto actual = usize(lua_gettop(lua));
   if (slot->arity != variadic_arity && actual != slot->arity) {
@@ -1912,33 +2064,38 @@ int State::dispatch(void *lua_state) {
     } else {
       result_count = rstd::move(result).unwrap_unchecked();
     }
-    if (!invocation.handle_returns.is_empty()) {
-      auto count = invocation.handle_returns.len();
-      if (!lua_checkstack(lua, static_cast<int>(count.to_primitive()))) {
-        slot->pending_error = Some(
-            Error{ErrorKind::Memory, slot->source.clone(),
-                  "Lua result stack allocation failed"_Str, String::make()});
-        return raise_pending_error(lua, slot);
-      }
-      for (const auto &value : invocation.handle_returns)
-        push_lua_value(lua, value);
-      return static_cast<int>(count.to_primitive());
+    slot->handle_returns = rstd::move(invocation.handle_returns);
+    slot->raised_handle = rstd::move(invocation.raised_handle);
+    slot->raised_value = rstd::move(invocation.raised);
+  }
+
+  if (!slot->handle_returns.is_empty()) {
+    auto count = slot->handle_returns.len();
+    if (!lua_checkstack(lua, static_cast<int>(count.to_primitive()))) {
+      slot->pending_error = Some(
+          Error{ErrorKind::Memory, slot->source.clone(),
+                "Lua result stack allocation failed"_Str, String::make()});
+      return raise_pending_error(lua, slot);
     }
-    if (invocation.raised_handle.is_some()) {
-      auto value = rstd::move(*invocation.raised_handle);
+    for (const auto &value : slot->handle_returns)
       push_lua_value(lua, value);
-      return lua_error(lua);
+    slot->handle_returns.clear();
+    return static_cast<int>(count.to_primitive());
+  }
+  if (slot->raised_handle.is_some()) {
+    push_lua_value(lua, *slot->raised_handle);
+    slot->raised_handle = None();
+    return lua_error(lua);
+  }
+  if (slot->raised_value.is_some()) {
+    if (!push_value(lua, *slot->raised_value)) {
+      slot->pending_error = Some(Error{
+          ErrorKind::Memory, slot->source.clone(),
+          "Lua raise value stack allocation failed"_Str, String::make()});
+      return raise_pending_error(lua, slot);
     }
-    if (invocation.raised.is_some()) {
-      auto value = rstd::move(*invocation.raised);
-      if (!push_value(lua, value)) {
-        slot->pending_error = Some(Error{
-            ErrorKind::Memory, slot->source.clone(),
-            "Lua raise value stack allocation failed"_Str, String::make()});
-        return raise_pending_error(lua, slot);
-      }
-      return lua_error(lua);
-    }
+    slot->raised_value = None();
+    return lua_error(lua);
   }
 
   if (slot->pending_error.is_some())
@@ -1988,9 +2145,8 @@ int State::dispatch(void *lua_state) {
 int async_continuation(lua_State *lua, int, lua_KContext context) {
   auto *pending = reinterpret_cast<AsyncPending *>(context);
   if (pending->error.is_some()) {
-    auto message = rstd::move(*pending->error);
-    delete pending;
-    push_string(lua, message);
+    push_error(lua, *pending->error);
+    storage_for_lua(lua)->finish_pending(pending);
     return lua_error(lua);
   }
   int count = 0;
@@ -2006,7 +2162,7 @@ int async_continuation(lua_State *lua, int, lua_KContext context) {
         ++count;
     }
   }
-  delete pending;
+  storage_for_lua(lua)->finish_pending(pending);
   return count;
 }
 
@@ -2037,22 +2193,35 @@ int State::dispatch_async(void *lua_state) {
     });
     return raise_pending_error(lua, slot);
   }
-  Invocation invocation{lua, slot};
-  auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
-                         actual, read_i64, read_bool, read_string, read_table,
-                         read_array, read_opaque, stage_value, stage_nil,
-                         raise_value, read_lua_argument, stage_handle,
-                         new_lua_table, raise_handle_value);
-  auto started = (**slot->async_starter)(frame);
-  if (started.is_err()) {
-    auto error = rstd::move(started).unwrap_err();
-    if (error.source.is_empty())
-      error.source = slot->source.clone();
-    slot->pending_error = Some(rstd::move(error));
+  AsyncPending *pending = nullptr;
+  {
+    Invocation invocation{lua, slot};
+    auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
+                           actual, read_i64, read_bool, read_string, read_table,
+                           read_array, read_opaque, stage_value, stage_nil,
+                           raise_value, read_lua_argument, stage_handle,
+                           new_lua_table, raise_handle_value);
+    auto started = (**slot->async_starter)(frame);
+    if (started.is_err()) {
+      auto error = rstd::move(started).unwrap_err();
+      if (error.source.is_empty())
+        error.source = slot->source.clone();
+      slot->pending_error = Some(rstd::move(error));
+    } else {
+      pending = new AsyncPending(
+          AsyncPending::values_task(rstd::move(started).unwrap()));
+    }
+  }
+  if (!pending)
+    return raise_pending_error(lua, slot);
+  if (!lua_checkstack(lua, 1)) {
+    pending->release();
+    slot->pending_error =
+        Some(Error::binding("Lua async result stack allocation failed"_Str));
     return raise_pending_error(lua, slot);
   }
-  auto *pending =
-      new AsyncPending(AsyncPending::values_task(rstd::move(started).unwrap()));
+  pending->thread = lua;
+  storage->pending.push(static_cast<AsyncPending *>(pending));
   lua_pushlightuserdata(lua, static_cast<void *>(pending));
   return lua_yieldk(lua, 1, reinterpret_cast<lua_KContext>(pending),
                     async_continuation);
@@ -2081,22 +2250,35 @@ int State::dispatch_async_handle(void *lua_state) {
                    String::make()});
     return raise_pending_error(lua, slot);
   }
-  Invocation invocation{lua, slot};
-  auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
-                         actual, read_i64, read_bool, read_string, read_table,
-                         read_array, read_opaque, stage_value, stage_nil,
-                         raise_value, read_lua_argument, stage_handle,
-                         new_lua_table, raise_handle_value);
-  auto started = (**slot->async_handle_starter)(frame);
-  if (started.is_err()) {
-    auto error = rstd::move(started).unwrap_err();
-    if (error.source.is_empty())
-      error.source = slot->source.clone();
-    slot->pending_error = Some(rstd::move(error));
+  AsyncPending *pending = nullptr;
+  {
+    Invocation invocation{lua, slot};
+    auto frame = CallFrame(static_cast<void *>(rstd::addressof(invocation)),
+                           actual, read_i64, read_bool, read_string, read_table,
+                           read_array, read_opaque, stage_value, stage_nil,
+                           raise_value, read_lua_argument, stage_handle,
+                           new_lua_table, raise_handle_value);
+    auto started = (**slot->async_handle_starter)(frame);
+    if (started.is_err()) {
+      auto error = rstd::move(started).unwrap_err();
+      if (error.source.is_empty())
+        error.source = slot->source.clone();
+      slot->pending_error = Some(rstd::move(error));
+    } else {
+      pending = new AsyncPending(
+          AsyncPending::handle_task(rstd::move(started).unwrap()));
+    }
+  }
+  if (!pending)
+    return raise_pending_error(lua, slot);
+  if (!lua_checkstack(lua, 1)) {
+    pending->release();
+    slot->pending_error =
+        Some(Error::binding("Lua async result stack allocation failed"_Str));
     return raise_pending_error(lua, slot);
   }
-  auto *pending =
-      new AsyncPending(AsyncPending::handle_task(rstd::move(started).unwrap()));
+  pending->thread = lua;
+  storage->pending.push(static_cast<AsyncPending *>(pending));
   lua_pushlightuserdata(lua, static_cast<void *>(pending));
   return lua_yieldk(lua, 1, reinterpret_cast<lua_KContext>(pending),
                     async_continuation);
@@ -3066,6 +3248,140 @@ int set_lua_value(lua_State *lua) {
   return 0;
 }
 
+struct MetatableRequest {
+  int reference;
+  int metatable;
+  bool has_metatable;
+};
+
+int get_lua_metatable(lua_State *lua) {
+  auto &request = *static_cast<MetatableRequest *>(lua_touserdata(lua, 1));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, request.reference);
+  if (lua_getmetatable(lua, -1) == 0)
+    lua_pushnil(lua);
+  return 1;
+}
+
+int set_lua_metatable(lua_State *lua) {
+  auto &request = *static_cast<MetatableRequest *>(lua_touserdata(lua, 1));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, request.reference);
+  if (request.has_metatable)
+    lua_rawgeti(lua, LUA_REGISTRYINDEX, request.metatable);
+  else
+    lua_pushnil(lua);
+  lua_setmetatable(lua, -2);
+  return 0;
+}
+
+auto TableHandle::metatable() -> Result<Option<TableHandle>> {
+  return metatable_impl(false);
+}
+auto TableHandle::metatable_in_call() -> Result<Option<TableHandle>> {
+  return metatable_impl(true);
+}
+auto TableHandle::metatable_impl(bool in_call) -> Result<Option<TableHandle>> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (!in_call && storage->executing)
+    return Err(reentrant_state_error());
+  auto access = [&]() -> Result<Option<TableHandle>> {
+    auto *lua = storage->lua;
+    auto top = lua_gettop(lua);
+    if (!lua_checkstack(lua, 2))
+      return Err(Error::binding("Lua metatable stack allocation failed"_Str));
+    MetatableRequest request{handle.reference, 0, false};
+    lua_pushcfunction(lua, get_lua_metatable);
+    lua_pushlightuserdata(lua, &request);
+    auto status = lua_pcall(lua, 1, 1, 0);
+    if (status != LUA_OK) {
+      auto error = error_from_top(
+          lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+          "get metatable"_Str);
+      if (!in_call)
+        clear_callback_transients(storage);
+      lua_settop(lua, top);
+      return Err(rstd::move(error));
+    }
+    auto result = read_lua_value(lua, -1, owner);
+    if (!in_call)
+      clear_callback_transients(storage);
+    lua_settop(lua, top);
+    if (result.is_err())
+      return Err(rstd::move(result).unwrap_err());
+    if (result->is_Nil())
+      return Ok<Option<TableHandle>>(None());
+    if (!result->is_Table())
+      return Err(Error::binding("Lua metatable is not a table"_Str));
+    return Ok(Some(rstd::move(*result).as_Table().value));
+  };
+  if (in_call)
+    return access();
+  ExecutionGuard guard(*storage);
+  return access();
+}
+
+auto TableHandle::set_metatable(const TableHandle *value) -> Result<empty> {
+  return set_metatable_impl(value, false);
+}
+auto TableHandle::set_metatable_in_call(const TableHandle *value)
+    -> Result<empty> {
+  return set_metatable_impl(value, true);
+}
+auto TableHandle::set_metatable_impl(const TableHandle *value, bool in_call)
+    -> Result<empty> {
+  if (!handle_ || (value && !value->handle_))
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (!in_call && storage->executing)
+    return Err(reentrant_state_error());
+  int reference = 0;
+  if (value) {
+    auto &meta = *registry_handle(value->handle_);
+    auto meta_owner = meta.owner.upgrade();
+    if (!meta_owner)
+      return Err(Error::binding("Lua state was destroyed"_Str));
+    if (!SharedState::ptr_eq(owner, meta_owner))
+      return Err(Error::binding("Lua handles belong to different states"_Str));
+    reference = meta.reference;
+  }
+  auto access = [&]() -> Result<empty> {
+    auto *lua = storage->lua;
+    auto top = lua_gettop(lua);
+    if (!lua_checkstack(lua, 2))
+      return Err(Error::binding("Lua metatable stack allocation failed"_Str));
+    MetatableRequest request{handle.reference, reference, value != nullptr};
+    lua_pushcfunction(lua, set_lua_metatable);
+    lua_pushlightuserdata(lua, &request);
+    auto status = lua_pcall(lua, 1, 0, 0);
+    if (status != LUA_OK) {
+      auto error = error_from_top(
+          lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+          "set metatable"_Str);
+      if (!in_call)
+        clear_callback_transients(storage);
+      lua_settop(lua, top);
+      return Err(rstd::move(error));
+    }
+    if (!in_call)
+      clear_callback_transients(storage);
+    lua_settop(lua, top);
+    return Ok(empty{});
+  };
+  if (in_call)
+    return access();
+  ExecutionGuard guard(*storage);
+  return access();
+}
+
 auto TableHandle::get_value(ref<str> name) -> Result<LuaValue> {
   return get_value_impl(name, false);
 }
@@ -3306,23 +3622,36 @@ auto FunctionHandle::call_multi(Array arguments) -> Result<Array> {
   return Ok(Array::from(rstd::move(request.output)));
 }
 
+auto failed_async_call(Error error) -> rstd::async::coro<Result<MultiValue>> {
+  co_return Err(rstd::move(error));
+}
+
 auto FunctionHandle::call_async(MultiValue arguments)
     -> rstd::async::coro<Result<MultiValue>> {
-  return call_async_impl(rstd::move(arguments), false);
+  auto owned = clone();
+  if (owned.is_err())
+    return failed_async_call(rstd::move(owned).unwrap_err());
+  return call_async_impl(rstd::move(owned).unwrap(), rstd::move(arguments),
+                         false);
 }
 
 auto FunctionHandle::call_async_nested(MultiValue arguments)
     -> rstd::async::coro<Result<MultiValue>> {
-  return call_async_impl(rstd::move(arguments), true);
+  auto owned = clone();
+  if (owned.is_err())
+    return failed_async_call(rstd::move(owned).unwrap_err());
+  return call_async_impl(rstd::move(owned).unwrap(), rstd::move(arguments),
+                         true);
 }
 
-auto FunctionHandle::call_async_impl(MultiValue arguments, bool nested)
+auto FunctionHandle::call_async_impl(FunctionHandle function,
+                                     MultiValue arguments, bool nested)
     -> rstd::async::coro<Result<MultiValue>> {
-  if (!handle_)
+  if (!function.handle_)
     co_return Err(Error::binding("Lua function handle was moved"_Str));
   if (arguments.len() > usize(64))
     co_return Err(Error::binding("too many Lua arguments"_Str));
-  auto &handle = *registry_handle(handle_);
+  auto &handle = *registry_handle(function.handle_);
   auto owner = handle.owner.upgrade();
   if (!owner)
     co_return Err(Error::binding("Lua state was destroyed"_Str));
@@ -3334,56 +3663,80 @@ auto FunctionHandle::call_async_impl(MultiValue arguments, bool nested)
     if (valid.is_err())
       co_return Err(rstd::move(valid).unwrap_err());
   }
-  Option<ExecutionGuard> guard;
-  if (!nested)
-    guard = Some(ExecutionGuard(*storage));
   auto *lua = storage->lua;
   auto top = lua_gettop(lua);
-  auto *thread = lua_newthread(lua);
-  if (thread == nullptr || !lua_checkstack(thread, 8)) {
-    lua_settop(lua, top);
+  auto remaining = nested && storage->executing ? storage->remaining
+                                                : storage->instruction_limit;
+  if (!lua_checkstack(lua, 2))
     co_return Err(Error::binding("Lua call stack allocation failed"_Str));
+  AsyncThreadCreation creation{nullptr, LUA_NOREF, handle.reference,
+                               &arguments};
+  lua_pushcfunction(lua, create_async_thread);
+  lua_pushlightuserdata(lua, &creation);
+  int create_status;
+  {
+    AsyncExecutionGuard guard(*storage, remaining);
+    create_status = lua_pcall(lua, 1, 0, 0);
   }
+  if (create_status != LUA_OK) {
+    auto error = error_from_top(
+        lua,
+        create_status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "function"_Str);
+    lua_settop(lua, top);
+    co_return Err(rstd::move(error));
+  }
+  if (!creation.thread)
+    co_return Err(Error::binding("Lua call stack allocation failed"_Str));
+  // Keep suspended threads out of the main stack, which other calls may use.
+  auto *thread = creation.thread;
+  AsyncThreadGuard thread_guard{*storage, thread, creation.reference,
+                                remaining};
   auto *co_owner = rstd::addressof(owner);
-  lua_rawgeti(thread, LUA_REGISTRYINDEX, handle.reference);
-  for (const auto &value : arguments.values()) {
-    push_lua_value(thread, value);
-  }
   int nresults = 0;
-  int status = lua_resume(
-      thread, lua, static_cast<int>(arguments.len().to_primitive()), &nresults);
+  int status;
+  {
+    AsyncExecutionGuard guard(*storage, remaining);
+    status =
+        lua_resume(thread, lua,
+                   static_cast<int>(arguments.len().to_primitive()), &nresults);
+  }
   while (status == LUA_YIELD) {
     if (lua_gettop(thread) < 1 || !lua_islightuserdata(thread, -1)) {
-      lua_settop(lua, top);
       co_return Err(
           Error::binding("Lua async function yielded an invalid value"_Str));
     }
     auto *pending = static_cast<AsyncPending *>(lua_touserdata(thread, -1));
     lua_pop(thread, 1);
+    if (!storage->has_pending(pending) || pending->thread != thread)
+      co_return Err(Error::binding(
+          "Lua async function yielded an unknown operation"_Str));
+    AsyncPendingGuard pending_guard(*storage, pending);
     if (pending->kind == AsyncPending::Kind::Values) {
       auto outcome = co_await rstd::move(*pending->values);
       if (outcome.is_err()) {
-        auto error = rstd::move(outcome).unwrap_err();
-        pending->error = Some(error.message.clone());
+        pending->error = Some(rstd::move(outcome).unwrap_err());
       } else {
         pending->results = rstd::move(*outcome);
       }
     } else {
       auto outcome = co_await rstd::move(*pending->handle);
       if (outcome.is_err()) {
-        auto error = rstd::move(outcome).unwrap_err();
-        pending->error = Some(error.message.clone());
+        pending->error = Some(rstd::move(outcome).unwrap_err());
       } else {
         pending->handle_result = Some(take_lua_value(*outcome));
       }
     }
-    status = lua_resume(thread, lua, 0, &nresults);
+    {
+      AsyncExecutionGuard guard(*storage, remaining);
+      status = lua_resume(thread, lua, 0, &nresults);
+    }
   }
+  thread_guard.finished = status == LUA_OK;
   if (status != LUA_OK) {
     auto error = error_from_top(
         thread, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
         "function"_Str);
-    lua_settop(lua, top);
     co_return Err(rstd::move(error));
   }
   auto output = MultiValue::make();
@@ -3392,12 +3745,10 @@ auto FunctionHandle::call_async_impl(MultiValue arguments, bool nested)
   for (int index = 0; index < total; ++index) {
     auto value = read_lua_value(thread, base + index, *co_owner);
     if (value.is_err()) {
-      lua_settop(lua, top);
       co_return Err(rstd::move(value).unwrap_err());
     }
     output.push(rstd::move(*value));
   }
-  lua_settop(lua, top);
   co_return Ok(rstd::move(output));
 }
 

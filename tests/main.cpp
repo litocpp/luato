@@ -265,6 +265,39 @@ void expect_native_require_module(Checks &checks) {
                 "shared library requests should not use a native loader");
 }
 
+void expect_metatables(Checks &checks) {
+  auto created = luato::State::create(luato::StateOptions::build_script());
+  auto other_created =
+      luato::State::create(luato::StateOptions::build_script());
+  checks.expect(created.is_ok() && other_created.is_ok(), "metatable states");
+  if (created.is_err() || other_created.is_err())
+    return;
+  auto state = rstd::move(*created);
+  auto other = rstd::move(*other_created);
+  auto table = state.create_table();
+  auto meta = state.create_table();
+  auto foreign = other.create_table();
+  checks.expect(table.is_ok() && meta.is_ok() && foreign.is_ok(),
+                "metatable tables");
+  if (table.is_err() || meta.is_err() || foreign.is_err())
+    return;
+  auto initial = table->metatable();
+  checks.expect(initial.is_ok() && initial->is_none(),
+                "initial metatable is absent");
+  checks.expect(table->set_metatable(&*foreign).is_err(),
+                "foreign metatable rejected");
+  checks.expect(table->set_metatable(&*meta).is_ok(), "set metatable");
+  auto actual = table->metatable();
+  checks.expect(actual.is_ok() && actual->is_some(), "read metatable");
+  if (actual.is_ok() && actual->is_some()) {
+    auto same = (**actual).same_object(*meta);
+    checks.expect(same.is_ok() && *same, "metatable identity");
+  }
+  checks.expect(table->set_metatable(nullptr).is_ok(), "clear metatable");
+  auto cleared = table->metatable();
+  checks.expect(cleared.is_ok() && cleared->is_none(), "metatable cleared");
+}
+
 void expect_lua_ffi(Checks &checks) {
   checks.expect(LUA_VERSION_NUM == 505,
                 "Lua FFI should export version constants");
@@ -349,6 +382,7 @@ int main() {
   int rejected_callback_drops{};
 
   expect_lua_ffi(checks);
+  expect_metatables(checks);
   expect_module_loader(checks);
   expect_native_require_module(checks);
 
