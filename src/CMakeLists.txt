@@ -33,5 +33,6 @@ target_sources(
          binding.cppm
          module_loader.cppm
          state.cppm
+         serde.cppm
          i18n/mod.cppm
          lib.cppm)
