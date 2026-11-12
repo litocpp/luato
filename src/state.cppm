@@ -280,29 +280,48 @@ private:
 
 namespace luato {
 
+AsyncNativeValuesFunctionSpec::AsyncNativeValuesFunctionSpec(
+    String name, usize arity, Box<AsyncValuesStarter> starter)
+    : name_(rstd::move(name)), arity_(arity), starter_(rstd::move(starter)) {}
+
+AsyncNativeValuesFunctionSpec::AsyncNativeValuesFunctionSpec(
+    AsyncNativeValuesFunctionSpec &&) noexcept = default;
+
+AsyncNativeValuesFunctionSpec &AsyncNativeValuesFunctionSpec::operator=(
+    AsyncNativeValuesFunctionSpec &&) noexcept = default;
+
+AsyncNativeValuesFunctionSpec::~AsyncNativeValuesFunctionSpec() = default;
+
+auto async_handle_values(rstd::async::coro<Result<OpaqueHandle>> task)
+    -> rstd::async::coro<Result<MultiValue>>;
+
 struct AsyncPending {
-  enum class Kind { Values, Handle };
+  enum class Kind { Values, LuaValues };
   Kind kind;
   Option<rstd::async::coro<Result<Array>>> values;
-  Option<rstd::async::coro<Result<OpaqueHandle>>> handle;
+  Option<rstd::async::coro<Result<MultiValue>>> lua_values;
   Array results;
-  Option<LuaValue> handle_result;
+  MultiValue lua_results;
   Option<Error> error;
   lua_State *thread{};
   unsigned references{1};
   bool active{true};
   static auto values_task(rstd::async::coro<Result<Array>> value)
       -> AsyncPending {
-    AsyncPending pending{Kind::Values, Some(rstd::move(value)),
-                         None(),       Array::make(),
-                         None(),       None()};
+    AsyncPending pending{Kind::Values,  Some(rstd::move(value)), None(),
+                         Array::make(), MultiValue::make(),      None()};
     return pending;
   }
-  static auto handle_task(rstd::async::coro<Result<OpaqueHandle>> value)
+  static auto lua_values_task(rstd::async::coro<Result<MultiValue>> value)
       -> AsyncPending {
-    AsyncPending pending{Kind::Handle,  None(), Some(rstd::move(value)),
-                         Array::make(), None(), None()};
+    AsyncPending pending{Kind::LuaValues,         None(),
+                         Some(rstd::move(value)), Array::make(),
+                         MultiValue::make(),      None()};
     return pending;
+  }
+  static auto lua_values_task(rstd::async::coro<Result<OpaqueHandle>> value)
+      -> AsyncPending {
+    return lua_values_task(async_handle_values(rstd::move(value)));
   }
   void retain() { ++references; }
   void release() {
@@ -318,6 +337,7 @@ struct CallbackSlot {
   Box<NativeCallback> callback;
   Option<Box<AsyncNativeStarter>> async_starter;
   Option<Box<AsyncHandleStarter>> async_handle_starter;
+  Option<Box<AsyncValuesStarter>> async_values_starter;
   Vec<Option<Value>> returns;
   Vec<LuaValue> handle_returns = Vec<LuaValue>::make();
   Option<LuaValue> raised_handle;
@@ -345,6 +365,15 @@ struct CallbackSlot {
         callback(Box<NativeCallback>::make(
             [](CallFrame &) -> BindingResult { return Ok(usize()); })),
         async_starter(None()), async_handle_starter(Some(rstd::move(starter))),
+        returns(Vec<Option<Value>>::make()), pending_error(None()) {}
+
+  CallbackSlot(String name, String source, usize arity,
+               Box<AsyncValuesStarter> starter)
+      : name(rstd::move(name)), source(rstd::move(source)), arity(arity),
+        callback(Box<NativeCallback>::make(
+            [](CallFrame &) -> BindingResult { return Ok(usize()); })),
+        async_starter(None()), async_handle_starter(None()),
+        async_values_starter(Some(rstd::move(starter))),
         returns(Vec<Option<Value>>::make()), pending_error(None()) {}
 };
 
@@ -1205,7 +1234,8 @@ int register_module(lua_State *state) {
     lua_pushcclosure(state,
                      slot->async_starter.is_some()
                          ? request->async_dispatcher
-                         : (slot->async_handle_starter.is_some()
+                         : (slot->async_handle_starter.is_some() ||
+                                    slot->async_values_starter.is_some()
                                 ? request->async_handle_dispatcher
                                 : request->dispatcher),
                      1);
@@ -1975,6 +2005,36 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
       }
     }
   }
+  for (auto index = usize(); index < module.async_values_functions_.len();
+       ++index) {
+    auto &function = module.async_values_functions_[index];
+    if (function.name_.is_empty()) {
+      return Err(Error::make(ErrorKind::Binding, module.name_.clone(),
+                             "async values function name cannot be empty"_Str));
+    }
+    auto duplicate = [&]() -> bool {
+      for (auto other = usize(); other < index; ++other)
+        if (module.async_values_functions_[other].name_ ==
+            function.name_.as_str())
+          return true;
+      for (const auto &sync : module.functions_)
+        if (sync.name_ == function.name_.as_str())
+          return true;
+      for (const auto &async : module.async_functions_)
+        if (async.name_ == function.name_.as_str())
+          return true;
+      for (const auto &handle : module.async_handle_functions_)
+        if (handle.name_ == function.name_.as_str())
+          return true;
+      return false;
+    }();
+    if (duplicate) {
+      return Err(Error::make(ErrorKind::Binding, module.name_.clone(),
+                             rstd::format("duplicate async function '{}.{}'",
+                                          module.name_.as_str(),
+                                          function.name_.as_str())));
+    }
+  }
   for (auto index = usize(); index < module.fields_.len(); ++index) {
     auto &field = module.fields_[index];
     if (field.key.is_empty()) {
@@ -1998,6 +2058,14 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
                                    module.name_.as_str(), field.key.as_str())));
     }
     for (const auto &function : module.async_functions_) {
+      if (function.name_ != field.key.as_str())
+        continue;
+      return Err(
+          Error::make(ErrorKind::Binding, module.name_.clone(),
+                      rstd::format("duplicate module member '{}.{}'",
+                                   module.name_.as_str(), field.key.as_str())));
+    }
+    for (const auto &function : module.async_values_functions_) {
       if (function.name_ != field.key.as_str())
         continue;
       return Err(
@@ -2036,6 +2104,16 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
         rstd::move(function.starter_)));
   }
 
+  for (auto index = usize(); index < module.async_values_functions_.len();
+       ++index) {
+    auto &function = module.async_values_functions_[index];
+    auto source =
+        rstd::format("{}.{}", module.name_.as_str(), function.name_.as_str());
+    storage->callbacks.push(Box<CallbackSlot>::make(
+        rstd::move(function.name_), rstd::move(source), function.arity_,
+        rstd::move(function.starter_)));
+  }
+
   auto dispatcher = +[](lua_State *state) -> int {
     return State::dispatch(static_cast<void *>(state));
   };
@@ -2053,7 +2131,8 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
       module.fields_.len(),
       first_slot,
       module.functions_.len() + module.async_functions_.len() +
-          module.async_handle_functions_.len(),
+          module.async_handle_functions_.len() +
+          module.async_values_functions_.len(),
       dispatcher,
       async_dispatcher,
       async_handle_dispatcher};
@@ -2108,6 +2187,16 @@ auto take_lua_value(OpaqueHandle handle) -> LuaValue {
   auto result = rstd::move(*value);
   delete value;
   return result;
+}
+
+auto async_handle_values(rstd::async::coro<Result<OpaqueHandle>> task)
+    -> rstd::async::coro<Result<MultiValue>> {
+  auto value = co_await rstd::move(task);
+  if (value.is_err())
+    co_return Err(rstd::move(value).unwrap_err());
+  auto result = MultiValue::make();
+  result.push(take_lua_value(*value));
+  co_return Ok(rstd::move(result));
 }
 
 int State::dispatch(void *lua_state) {
@@ -2230,17 +2319,33 @@ int State::dispatch(void *lua_state) {
 
 int async_continuation(lua_State *lua, int, lua_KContext context) {
   auto *pending = reinterpret_cast<AsyncPending *>(context);
+  int live_count = 0;
+  if (pending->error.is_none() &&
+      pending->kind == AsyncPending::Kind::LuaValues) {
+    bool overflow = false;
+    {
+      auto count = rstd::try_from<int>(pending->lua_results.len());
+      if (count.is_err())
+        overflow = true;
+      else
+        live_count = rstd::move(count).unwrap_unchecked();
+    }
+    if (overflow || !lua_checkstack(lua, live_count)) {
+      pending->error =
+          Some(Error::make(ErrorKind::Memory, String::make(),
+                           "Lua async result stack allocation failed"_Str));
+    }
+  }
   if (pending->error.is_some()) {
     push_error(lua, *pending->error);
     storage_for_lua(lua)->finish_pending(pending);
     return lua_error(lua);
   }
   int count = 0;
-  if (pending->kind == AsyncPending::Kind::Handle) {
-    if (pending->handle_result.is_some() && lua_checkstack(lua, 1)) {
-      push_lua_value(lua, *pending->handle_result);
-      count = 1;
-    }
+  if (pending->kind == AsyncPending::Kind::LuaValues) {
+    for (const auto &value : pending->lua_results.values())
+      push_lua_value(lua, value);
+    count = live_count;
   } else if (lua_checkstack(lua, static_cast<int>(
                                      pending->results.len().to_primitive()))) {
     for (const auto &value : pending->results.values()) {
@@ -2344,16 +2449,20 @@ int State::dispatch_async_handle(void *lua_state) {
                            read_array, read_opaque, stage_value, stage_nil,
                            raise_value, read_lua_argument, stage_handle,
                            new_lua_table, raise_handle_value);
-    auto started = (**slot->async_handle_starter)(frame);
-    if (started.is_err()) {
-      auto error = rstd::move(started).unwrap_err();
-      if (error.source.is_empty())
-        error.source = slot->source.clone();
-      slot->pending_error = Some(rstd::move(error));
-    } else {
-      pending = new AsyncPending(
-          AsyncPending::handle_task(rstd::move(started).unwrap()));
-    }
+    auto start = [slot](auto started) -> AsyncPending * {
+      if (started.is_err()) {
+        auto error = rstd::move(started).unwrap_err();
+        if (error.source.is_empty())
+          error.source = slot->source.clone();
+        slot->pending_error = Some(rstd::move(error));
+        return nullptr;
+      }
+      return new AsyncPending(
+          AsyncPending::lua_values_task(rstd::move(started).unwrap()));
+    };
+    pending = slot->async_values_starter.is_some()
+                  ? start((**slot->async_values_starter)(frame))
+                  : start((**slot->async_handle_starter)(frame));
   }
   if (!pending)
     return raise_pending_error(lua, slot);
@@ -3969,11 +4078,19 @@ auto FunctionHandle::call_async_impl(FunctionHandle function,
         pending->results = rstd::move(*outcome);
       }
     } else {
-      auto outcome = co_await rstd::move(*pending->handle);
+      auto outcome = co_await rstd::move(*pending->lua_values);
       if (outcome.is_err()) {
         pending->error = Some(rstd::move(outcome).unwrap_err());
       } else {
-        pending->handle_result = Some(take_lua_value(*outcome));
+        for (const auto &value : outcome->values()) {
+          auto valid = validate_lua_value(value, owner);
+          if (valid.is_err()) {
+            pending->error = Some(rstd::move(valid).unwrap_err());
+            break;
+          }
+        }
+        if (pending->error.is_none())
+          pending->lua_results = rstd::move(*outcome);
       }
     }
     {

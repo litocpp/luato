@@ -15,6 +15,7 @@ class State;
 class Table;
 class Array;
 class LuaValue;
+class MultiValue;
 class CallFrame;
 
 struct OpaqueHandle {
@@ -449,6 +450,8 @@ using AsyncNativeStarter =
     dyn<FnMut<Result<rstd::async::coro<Result<Array>>>(CallFrame &)>>;
 using AsyncHandleStarter =
     dyn<FnMut<Result<rstd::async::coro<Result<OpaqueHandle>>>(CallFrame &)>>;
+using AsyncValuesStarter =
+    dyn<FnMut<Result<rstd::async::coro<Result<MultiValue>>>(CallFrame &)>>;
 
 } // namespace luato
 
@@ -764,12 +767,39 @@ private:
   friend class State;
 };
 
+class AsyncNativeValuesFunctionSpec {
+public:
+  AsyncNativeValuesFunctionSpec(AsyncNativeValuesFunctionSpec &&) noexcept;
+  AsyncNativeValuesFunctionSpec &
+  operator=(AsyncNativeValuesFunctionSpec &&) noexcept;
+  ~AsyncNativeValuesFunctionSpec();
+
+  template <typename Callable>
+  static auto make(String name, usize arity, Callable &&callable)
+      -> AsyncNativeValuesFunctionSpec {
+    return AsyncNativeValuesFunctionSpec(
+        rstd::move(name), arity,
+        Box<AsyncValuesStarter>::make(rstd::forward<Callable>(callable)));
+  }
+
+private:
+  AsyncNativeValuesFunctionSpec(String name, usize arity,
+                                Box<AsyncValuesStarter> starter);
+
+  String name_;
+  usize arity_;
+  Box<AsyncValuesStarter> starter_;
+
+  friend class State;
+};
+
 class ModuleSpec {
 public:
   explicit ModuleSpec(String name)
       : name_(rstd::move(name)), functions_(Vec<NativeFunctionSpec>::make()),
         async_functions_(Vec<AsyncNativeFunctionSpec>::make()),
         async_handle_functions_(Vec<AsyncNativeHandleFunctionSpec>::make()),
+        async_values_functions_(Vec<AsyncNativeValuesFunctionSpec>::make()),
         fields_(Vec<TableEntry>::make()) {}
 
   ModuleSpec(ModuleSpec &&) noexcept = default;
@@ -824,6 +854,13 @@ public:
     async_handle_functions_.push(AsyncNativeHandleFunctionSpec::make(
         rstd::move(name), arity, rstd::forward<Callable>(callable)));
   }
+  // Capture frame arguments before returning the task; results retain Lua
+  // identity.
+  template <typename Callable>
+  void async_values_function(String name, usize arity, Callable &&callable) {
+    async_values_functions_.push(AsyncNativeValuesFunctionSpec::make(
+        rstd::move(name), arity, rstd::forward<Callable>(callable)));
+  }
   void set(String name, i64 value) {
     fields_.push(TableEntry{rstd::move(name), Value::Integer(value)});
   }
@@ -846,6 +883,7 @@ private:
   Vec<NativeFunctionSpec> functions_;
   Vec<AsyncNativeFunctionSpec> async_functions_;
   Vec<AsyncNativeHandleFunctionSpec> async_handle_functions_;
+  Vec<AsyncNativeValuesFunctionSpec> async_values_functions_;
   Vec<TableEntry> fields_;
 
   friend class State;
