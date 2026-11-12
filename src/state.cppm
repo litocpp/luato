@@ -77,9 +77,9 @@ private:
                                   bool open_utf8, bool restricted = false,
                                   u64 instructions = u64()) noexcept
       : open_base_(open_base), open_string_(open_string),
-        open_table_(open_table), open_math_(open_math),
-        open_utf8_(open_utf8), restricted_(restricted),
-        text_only_(restricted), instructions_(instructions) {}
+        open_table_(open_table), open_math_(open_math), open_utf8_(open_utf8),
+        restricted_(restricted), text_only_(restricted),
+        instructions_(instructions) {}
 
   bool open_base_;
   bool open_string_;
@@ -159,6 +159,15 @@ public:
   auto to_table() -> Result<Table>;
   auto get_in_call(const LuaValue &key) -> Result<LuaValue>;
   auto set_in_call(const LuaValue &key, const LuaValue &value) -> Result<empty>;
+  // Scalar field lookups honor __index and Lua string/number coercion.
+  auto string_field_in_call(ref<str> name) -> Result<Option<String>>;
+  auto number_field_in_call(ref<str> name) -> Result<Option<f64>>;
+  // Creates an error value through the same owner as native callback failures.
+  auto set_error_in_call(const LuaValue &key, const Error &error)
+      -> Result<empty>;
+  // Only recognizes error values created by this owner, not ordinary Lua
+  // tables.
+  auto error_in_call() -> Result<Option<Error>>;
   auto to_value() -> Result<Value>;
   auto raw_set(const LuaValue &key, const LuaValue &value) -> Result<empty>;
 
@@ -170,9 +179,11 @@ private:
   auto get_value_impl(ref<str> name, bool raw) -> Result<LuaValue>;
   auto get_impl(const LuaValue &key, bool raw) -> Result<LuaValue>;
   auto metatable_impl(bool in_call) -> Result<Option<TableHandle>>;
-  auto set_metatable_impl(const TableHandle *value, bool in_call) -> Result<empty>;
+  auto set_metatable_impl(const TableHandle *value, bool in_call)
+      -> Result<empty>;
   auto set_impl(const LuaValue &key, const LuaValue &value, bool raw)
       -> Result<empty>;
+  auto scalar_field_in_call(ref<str> name, bool number) -> Result<LuaValue>;
   void *handle_;
   friend class State;
   friend struct LuaValueAccess;
@@ -606,9 +617,7 @@ struct NativeError {
   bool initialized{};
   alignas(Error) unsigned char storage[sizeof(Error)];
 
-  auto get() noexcept -> Error * {
-    return reinterpret_cast<Error *>(storage);
-  }
+  auto get() noexcept -> Error * { return reinterpret_cast<Error *>(storage); }
 };
 
 auto native_error_userdata(lua_State *state, int index) noexcept
@@ -640,10 +649,11 @@ void push_native_error(lua_State *state, const Error &error) {
   auto *native = static_cast<NativeError *>(
       lua_newuserdatauv(state, sizeof(NativeError), 0));
   rstd::ptr_::construct(mut_ptr<NativeError>::from_raw_parts(native));
-  // Install the finalizer before acquiring ownership; later Lua allocation may longjmp.
+  // Install the finalizer before acquiring ownership; later Lua allocation may
+  // longjmp.
   luaL_setmetatable(state, native_error_metatable);
   rstd::ptr_::construct(mut_ptr<Error>::from_raw_parts(native->get()),
-                       error.clone());
+                        error.clone());
   native->initialized = true;
 }
 
@@ -807,7 +817,8 @@ auto error_field(lua_State *state, int object, int field, ref<str> fallback)
   return result;
 }
 
-auto named_error_field(lua_State *state, int object, const char *name) -> String {
+auto named_error_field(lua_State *state, int object, const char *name)
+    -> String {
   lua_pushstring(state, name);
   lua_rawget(state, object);
   auto result = copied_lua_string(state, -1, ""_str);
@@ -822,9 +833,9 @@ auto error_from_top(lua_State *state, ErrorKind default_kind,
     if (lua_istable(state, object)) {
       auto message = named_error_field(state, object, "message");
       auto code = named_error_field(state, object, "code");
-      if (! code.is_empty()) {
+      if (!code.is_empty()) {
         auto combined = String::make(code.as_str());
-        if (! message.is_empty()) {
+        if (!message.is_empty()) {
           combined.push_str(": "_str);
           combined.push_str(message.as_str());
         }
@@ -834,10 +845,11 @@ auto error_from_top(lua_State *state, ErrorKind default_kind,
       if (message.is_empty())
         message = copied_lua_string(state, object, "unknown Lua error"_str);
       auto domain = named_error_field(state, object, "domain");
-      Error result{default_kind, rstd::move(default_source), rstd::move(message),
-                   rstd::move(traceback)};
+      Error result{default_kind, rstd::move(default_source),
+                   rstd::move(message), rstd::move(traceback)};
       if (!domain.is_empty() || !code.is_empty())
-        result.details = Some(ErrorDetails{rstd::move(domain), rstd::move(code)});
+        result.details =
+            Some(ErrorDetails{rstd::move(domain), rstd::move(code)});
       return restore_native_error(state, object, rstd::move(result));
     }
     return {default_kind, rstd::move(default_source),
@@ -860,7 +872,8 @@ auto error_from_top(lua_State *state, ErrorKind default_kind,
   auto traceback = error_field(state, object, ERROR_TRACEBACK, ""_str);
   auto domain = named_error_field(state, object, "domain");
   auto code = named_error_field(state, object, "code");
-  Error result{kind, rstd::move(source), rstd::move(message), rstd::move(traceback)};
+  Error result{kind, rstd::move(source), rstd::move(message),
+               rstd::move(traceback)};
   if (!domain.is_empty() || !code.is_empty())
     result.details = Some(ErrorDetails{rstd::move(domain), rstd::move(code)});
   return restore_native_error(state, object, rstd::move(result));
@@ -868,6 +881,12 @@ auto error_from_top(lua_State *state, ErrorKind default_kind,
 
 int traceback_handler(lua_State *state) {
   if (is_luato_error(state, 1)) {
+    lua_rawgeti(state, 1, ERROR_TRACEBACK);
+    if (lua_type(state, -1) == LUA_TSTRING && lua_rawlen(state, -1) != 0) {
+      lua_settop(state, 1);
+      return 1;
+    }
+    lua_pop(state, 1);
     lua_rawgeti(state, 1, ERROR_MESSAGE);
     size_t length{};
     char const *message = lua_tolstring(state, -1, &length);
@@ -2139,9 +2158,9 @@ int State::dispatch(void *lua_state) {
   if (!slot->handle_returns.is_empty()) {
     auto count = slot->handle_returns.len();
     if (!lua_checkstack(lua, static_cast<int>(count.to_primitive()))) {
-      slot->pending_error = Some(
-          Error{ErrorKind::Memory, slot->source.clone(),
-                "Lua result stack allocation failed"_Str, String::make()});
+      slot->pending_error =
+          Some(Error{ErrorKind::Memory, slot->source.clone(),
+                     "Lua result stack allocation failed"_Str, String::make()});
       return raise_pending_error(lua, slot);
     }
     for (const auto &value : slot->handle_returns)
@@ -2156,9 +2175,9 @@ int State::dispatch(void *lua_state) {
   }
   if (slot->raised_value.is_some()) {
     if (!push_value(lua, *slot->raised_value)) {
-      slot->pending_error = Some(Error{
-          ErrorKind::Memory, slot->source.clone(),
-          "Lua raise value stack allocation failed"_Str, String::make()});
+      slot->pending_error = Some(
+          Error{ErrorKind::Memory, slot->source.clone(),
+                "Lua raise value stack allocation failed"_Str, String::make()});
       return raise_pending_error(lua, slot);
     }
     slot->raised_value = None();
@@ -3249,6 +3268,169 @@ auto TableHandle::set_in_call(const LuaValue &key, const LuaValue &value)
   lua_rawset(lua, -3);
   lua_settop(lua, top);
   return Ok(empty{});
+}
+
+struct ScalarFieldRequest {
+  int reference;
+  ref<str> name;
+  bool number;
+};
+
+int lookup_scalar_field(lua_State *lua) {
+  auto &request = *static_cast<ScalarFieldRequest *>(lua_touserdata(lua, 1));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, request.reference);
+  lua_pushlstring(lua, reinterpret_cast<const char *>(request.name.data()),
+                  request.name.len().to_primitive());
+  lua_gettable(lua, -2);
+  if (lua_isnil(lua, -1))
+    return 1;
+  if (request.number) {
+    int valid{};
+    auto value = lua_tonumberx(lua, -1, &valid);
+    if (!valid)
+      return luaL_error(lua, "expected a number or numeric string");
+    lua_pushnumber(lua, value);
+  } else {
+    if (!lua_isstring(lua, -1))
+      return luaL_error(lua, "expected a string or number");
+    (void)lua_tolstring(lua, -1, nullptr);
+  }
+  return 1;
+}
+
+auto TableHandle::scalar_field_in_call(ref<str> name, bool number)
+    -> Result<LuaValue> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *lua = owner.as_ptr().as_raw_ptr()->lua;
+  auto top = lua_gettop(lua);
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua lookup stack allocation failed"_Str));
+  ScalarFieldRequest request{handle.reference, name, number};
+  lua_pushcfunction(lua, lookup_scalar_field);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 1, 0);
+  if (status != LUA_OK) {
+    auto error = error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Type,
+        "table scalar field"_Str);
+    lua_settop(lua, top);
+    return Err(rstd::move(error));
+  }
+  auto value = read_lua_value(lua, -1, owner);
+  lua_settop(lua, top);
+  return value;
+}
+
+auto TableHandle::string_field_in_call(ref<str> name)
+    -> Result<Option<String>> {
+  auto value = scalar_field_in_call(name, false);
+  if (value.is_err())
+    return Err(rstd::move(value).unwrap_err());
+  if (value->is_Nil())
+    return Ok<Option<String>>(None());
+  auto text = value->as_utf8();
+  if (text.is_err())
+    return Err(rstd::move(text).unwrap_err());
+  return Ok(Some(String::make(*text)));
+}
+
+auto TableHandle::number_field_in_call(ref<str> name) -> Result<Option<f64>> {
+  auto value = scalar_field_in_call(name, true);
+  if (value.is_err())
+    return Err(rstd::move(value).unwrap_err());
+  if (value->is_Nil())
+    return Ok<Option<f64>>(None());
+  return Ok(Some(value->as_Number().value));
+}
+
+struct ErrorFieldRequest {
+  int reference;
+  const LuaValue *key;
+  const Error *error;
+};
+
+int set_error_field(lua_State *lua) {
+  auto &request = *static_cast<ErrorFieldRequest *>(lua_touserdata(lua, 1));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, request.reference);
+  push_lua_value(lua, *request.key);
+  push_error(lua, *request.error);
+  lua_rawset(lua, -3);
+  return 0;
+}
+
+auto TableHandle::set_error_in_call(const LuaValue &key, const Error &error)
+    -> Result<empty> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto valid = validate_lua_value(key, owner);
+  if (valid.is_err())
+    return Err(rstd::move(valid).unwrap_err());
+  auto *lua = owner.as_ptr().as_raw_ptr()->lua;
+  auto top = lua_gettop(lua);
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua error field stack allocation failed"_Str));
+  ErrorFieldRequest request{handle.reference, &key, &error};
+  lua_pushcfunction(lua, set_error_field);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 0, 0);
+  if (status != LUA_OK) {
+    auto failure = error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "set error field"_Str);
+    lua_settop(lua, top);
+    return Err(rstd::move(failure));
+  }
+  lua_settop(lua, top);
+  return Ok(empty{});
+}
+
+struct ErrorReadRequest {
+  int reference;
+  Option<Error> error;
+};
+
+int read_table_error(lua_State *lua) {
+  auto &request = *static_cast<ErrorReadRequest *>(lua_touserdata(lua, 1));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, request.reference);
+  if (is_luato_error(lua, -1))
+    request.error =
+        Some(error_from_top(lua, ErrorKind::Runtime, String::make()));
+  return 0;
+}
+
+auto TableHandle::error_in_call() -> Result<Option<Error>> {
+  if (!handle_)
+    return Err(Error::binding("Lua table handle was moved"_Str));
+  auto &handle = *registry_handle(handle_);
+  auto owner = handle.owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto *lua = owner.as_ptr().as_raw_ptr()->lua;
+  auto top = lua_gettop(lua);
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua error lookup stack allocation failed"_Str));
+  ErrorReadRequest request{handle.reference, None()};
+  lua_pushcfunction(lua, read_table_error);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 0, 0);
+  if (status != LUA_OK) {
+    auto failure = error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "get error value"_Str);
+    lua_settop(lua, top);
+    return Err(rstd::move(failure));
+  }
+  lua_settop(lua, top);
+  return Ok(rstd::move(request.error));
 }
 
 auto TableHandle::get_function(ref<str> name) -> Result<FunctionHandle> {
