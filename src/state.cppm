@@ -594,10 +594,73 @@ constexpr int ERROR_MESSAGE = 4;
 constexpr int ERROR_TRACEBACK = 5;
 
 char error_marker;
+char native_error_marker;
 char module_cache_marker;
 char native_module_marker;
 
 int raise_error(lua_State *state, const Error &error);
+
+constexpr char native_error_metatable[] = "luato.native-error";
+
+struct NativeError {
+  bool initialized{};
+  alignas(Error) unsigned char storage[sizeof(Error)];
+
+  auto get() noexcept -> Error * {
+    return reinterpret_cast<Error *>(storage);
+  }
+};
+
+auto native_error_userdata(lua_State *state, int index) noexcept
+    -> NativeError * {
+  if (lua_type(state, index) != LUA_TUSERDATA ||
+      lua_rawlen(state, index) != sizeof(NativeError))
+    return nullptr;
+  return static_cast<NativeError *>(
+      luaL_testudata(state, index, native_error_metatable));
+}
+
+int collect_native_error(lua_State *state) {
+  auto *native = native_error_userdata(state, 1);
+  if (native && native->initialized) {
+    native->initialized = false;
+    rstd::ptr_::destroy(mut_ptr<Error>::from_raw_parts(native->get()));
+  }
+  return 0;
+}
+
+void push_native_error(lua_State *state, const Error &error) {
+  (void)luaL_newmetatable(state, native_error_metatable);
+  lua_pushcfunction(state, collect_native_error);
+  lua_setfield(state, -2, "__gc");
+  lua_pushboolean(state, false);
+  lua_setfield(state, -2, "__metatable");
+  lua_pop(state, 1);
+
+  auto *native = static_cast<NativeError *>(
+      lua_newuserdatauv(state, sizeof(NativeError), 0));
+  rstd::ptr_::construct(mut_ptr<NativeError>::from_raw_parts(native));
+  // Install the finalizer before acquiring ownership; later Lua allocation may longjmp.
+  luaL_setmetatable(state, native_error_metatable);
+  rstd::ptr_::construct(mut_ptr<Error>::from_raw_parts(native->get()),
+                       error.clone());
+  native->initialized = true;
+}
+
+auto restore_native_error(lua_State *state, int object, Error error) -> Error {
+  lua_rawgetp(state, object, &native_error_marker);
+  auto *native = native_error_userdata(state, -1);
+  lua_pop(state, 1);
+  if (!native || !native->initialized)
+    return error;
+  auto restored = native->get()->clone();
+  restored.kind = error.kind;
+  restored.source = rstd::move(error.source);
+  restored.message = rstd::move(error.message);
+  restored.traceback = rstd::move(error.traceback);
+  restored.details = rstd::move(error.details);
+  return restored;
+}
 
 auto copied_utf8(char const *bytes, size_t length) -> Option<String> {
   auto value = Vec<u8>::with_capacity(usize(length));
@@ -775,7 +838,7 @@ auto error_from_top(lua_State *state, ErrorKind default_kind,
                    rstd::move(traceback)};
       if (!domain.is_empty() || !code.is_empty())
         result.details = Some(ErrorDetails{rstd::move(domain), rstd::move(code)});
-      return result;
+      return restore_native_error(state, object, rstd::move(result));
     }
     return {default_kind, rstd::move(default_source),
             copied_lua_string(state, object, "unknown Lua error"_str),
@@ -800,7 +863,7 @@ auto error_from_top(lua_State *state, ErrorKind default_kind,
   Error result{kind, rstd::move(source), rstd::move(message), rstd::move(traceback)};
   if (!domain.is_empty() || !code.is_empty())
     result.details = Some(ErrorDetails{rstd::move(domain), rstd::move(code)});
-  return result;
+  return restore_native_error(state, object, rstd::move(result));
 }
 
 int traceback_handler(lua_State *state) {
@@ -1547,7 +1610,7 @@ auto raise_value(void *context, Value value) -> void {
 }
 
 void push_error(lua_State *state, const Error &error) {
-  lua_createtable(state, 5, 3);
+  lua_createtable(state, 5, 4);
   auto object = lua_gettop(state);
   lua_pushlightuserdata(state, static_cast<void *>(&error_marker));
   lua_rawseti(state, object, ERROR_TAG);
@@ -1566,6 +1629,10 @@ void push_error(lua_State *state, const Error &error) {
     lua_setfield(state, object, "code");
     push_string(state, error.message);
     lua_setfield(state, object, "message");
+  }
+  if (error.native_cause().is_some()) {
+    push_native_error(state, error);
+    lua_rawsetp(state, object, &native_error_marker);
   }
 }
 
