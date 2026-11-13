@@ -20,6 +20,7 @@ target_link_libraries(
   PUBLIC rstd::rstd
          rstd::parse
          rstd::json
+         rstd::serde
          luato::ffi::lua)
 target_sources(luato.lib PRIVATE i18n/mod.cpp)
 target_sources(

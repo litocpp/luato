@@ -14,18 +14,295 @@ export namespace luato {
 struct DeserializeOptions {
   const TableHandle *null_value{};
   usize max_depth{128};
+  const TableHandle *object_metatable{};
+  const TableHandle *array_metatable{};
 };
+
+struct SerializeOptions {
+  // Markers are borrowed during conversion and belong to the destination VM.
+  const TableHandle *null_value{};
+  const TableHandle *object_metatable{};
+  const TableHandle *array_metatable{};
+  bool serialize_none_to_null{true};
+  bool serialize_unit_to_null{true};
+  bool serialize_json_null_to_null{true};
+  usize max_depth{128};
+
+  static auto from_deserialize_options(DeserializeOptions source)
+      -> SerializeOptions {
+    auto options = SerializeOptions{};
+    options.null_value = source.null_value;
+    options.object_metatable = source.object_metatable;
+    options.array_metatable = source.array_metatable;
+    options.max_depth = source.max_depth;
+    return options;
+  }
+  static auto lua(DeserializeOptions source = {}) -> SerializeOptions {
+    auto options = from_deserialize_options(source);
+    options.serialize_none_to_null = false;
+    options.serialize_unit_to_null = false;
+    return options;
+  }
+  auto deserialize_options() const -> DeserializeOptions {
+    return {null_value, max_depth, object_metatable, array_metatable};
+  }
+};
+
+class ValueSequenceSerializer;
+class ValueMapSerializer;
+
+class ValueSerializer {
+  State *state_{};
+  CallFrame *frame_{};
+  SerializeOptions options_;
+  DataPath path_;
+  usize depth_{};
+
+public:
+  using value_type = LuaValue;
+  using error_type = SerdeError;
+  using result_type = rstd::Result<LuaValue, SerdeError>;
+  using sequence_type = ValueSequenceSerializer;
+  using map_type = ValueMapSerializer;
+
+  ValueSerializer(State &state, SerializeOptions options = {})
+      : state_(&state), options_(options) {}
+  ValueSerializer(CallFrame &frame, SerializeOptions options = {})
+      : frame_(&frame), options_(options) {}
+  auto invalid_value(ref<str> text) const -> SerdeError {
+    return SerdeError::invalid_value(path_.clone(), text);
+  }
+  auto unsupported(ref<str> text) const -> SerdeError {
+    return SerdeError::unsupported(path_.clone(), text);
+  }
+  auto invariant(ref<str> text) const -> SerdeError {
+    return SerdeError::invariant(path_.clone(), text);
+  }
+  template <class T>
+  auto host(Result<T> value) const -> rstd::Result<T, SerdeError> {
+    if (value.is_err())
+      return Err(SerdeError::invalid_value_with_source(
+          path_.clone(), "cannot write Lua value"_str,
+          rstd::move(value).unwrap_err()));
+    return Ok(rstd::move(value).unwrap());
+  }
+  auto child(DataPath path) const -> ValueSerializer {
+    auto result = frame_ ? ValueSerializer(*frame_, options_)
+                         : ValueSerializer(*state_, options_);
+    result.path_ = rstd::move(path);
+    result.depth_ = depth_ + usize(1);
+    return result;
+  }
+  auto field(ref<str> name) const -> ValueSerializer {
+    return child(path_.with_field(name));
+  }
+  auto index(usize index) const -> ValueSerializer {
+    return child(path_.with_index(index));
+  }
+  auto nested() const -> rstd::Result<empty, SerdeError> {
+    if (depth_ >= options_.max_depth)
+      return Err(invalid_value("Lua value nesting is too deep"_str));
+    return Ok(empty{});
+  }
+  auto table(const TableHandle *metatable)
+      -> rstd::Result<TableHandle, SerdeError> {
+    auto result = rstd_try(
+        host(frame_ ? frame_->create_table() : state_->create_table()));
+    if (metatable)
+      rstd_try(host(frame_ ? result.set_metatable_in_call(metatable)
+                           : result.set_metatable(metatable)));
+    return Ok(rstd::move(result));
+  }
+  auto set(TableHandle &table, const LuaValue &key, const LuaValue &value)
+      -> rstd::Result<empty, SerdeError> {
+    return host(frame_ ? table.set_in_call(key, value)
+                       : table.raw_set(key, value));
+  }
+  auto serialize_null() -> result_type {
+    if (!options_.null_value)
+      return Ok(LuaValue::Opaque(nullptr));
+    auto value = LuaValue::Table(rstd_try(host(options_.null_value->clone())));
+    rstd_try(host(frame_ ? frame_->validate_value(value)
+                         : state_->validate_value(value)));
+    return Ok(rstd::move(value));
+  }
+  auto serialize_none() -> result_type {
+    return options_.serialize_none_to_null ? serialize_null()
+                                           : result_type(Ok(LuaValue::Nil()));
+  }
+  auto serialize_unit() -> result_type {
+    return options_.serialize_unit_to_null ? serialize_null()
+                                           : result_type(Ok(LuaValue::Nil()));
+  }
+  auto serialize_json_null() -> result_type {
+    return options_.serialize_json_null_to_null
+               ? serialize_null()
+               : result_type(Ok(LuaValue::Nil()));
+  }
+  auto serialize_bool(bool value) -> result_type {
+    return Ok(LuaValue::Boolean(value));
+  }
+  auto serialize_i64(i64 value) -> result_type {
+    return Ok(LuaValue::Integer(value));
+  }
+  auto serialize_u64(u64 value) -> result_type {
+    auto integer = rstd::try_from<i64>(value);
+    if (integer.is_err())
+      return Err(invalid_value("integer out of Lua range"_str));
+    return serialize_i64(*integer);
+  }
+  auto serialize_f64(f64 value) -> result_type {
+    return Ok(LuaValue::Number(value));
+  }
+  auto serialize_string(ref<str> value) -> result_type {
+    return Ok(LuaValue::Bytes(Vec<u8>::from(value.as_bytes())));
+  }
+  auto serialize_bytes(slice<u8> value) -> result_type {
+    return Ok(LuaValue::Bytes(Vec<u8>::from(value)));
+  }
+  template <class T> auto serialize_some(const T &value) -> result_type {
+    rstd_try(nested());
+    auto sink = child(path_.clone());
+    return rstd::serde::serialize(sink, value);
+  }
+  template <class T>
+  auto serialize_newtype(ref<str>, const T &value) -> result_type {
+    return serialize_some(value);
+  }
+  auto serialize_unit_variant(ref<str> variant) -> result_type {
+    return serialize_string(variant);
+  }
+  template <class T>
+  auto serialize_newtype_variant(ref<str> variant, const T &value)
+      -> result_type {
+    rstd_try(nested());
+    auto result = rstd_try(table(options_.object_metatable));
+    auto sink = child(path_.with_variant(variant));
+    auto encoded = rstd_try(rstd::serde::serialize(sink, value));
+    auto key = rstd_try(serialize_string(variant));
+    rstd_try(sink.set(result, key, encoded));
+    return Ok(LuaValue::Table(rstd::move(result)));
+  }
+  template <class T>
+  auto serialize_extension(ref<str>, const T &) -> result_type {
+    return Err(unsupported("Lua does not support this extension"_str));
+  }
+  auto begin_sequence(usize)
+      -> rstd::Result<ValueSequenceSerializer, SerdeError>;
+  auto begin_map(usize) -> rstd::Result<ValueMapSerializer, SerdeError>;
+};
+
+class ValueSequenceSerializer {
+  ValueSerializer sink_;
+  TableHandle table_;
+  usize index_{};
+  bool ended_{};
+
+public:
+  using error_type = SerdeError;
+  ValueSequenceSerializer(ValueSerializer sink, TableHandle table)
+      : sink_(rstd::move(sink)), table_(rstd::move(table)) {}
+  template <class T>
+  auto element(const T &value) -> rstd::Result<empty, SerdeError> {
+    if (ended_)
+      return Err(sink_.invariant("sequence already ended"_str));
+    auto child = sink_.index(index_);
+    auto encoded = rstd_try(rstd::serde::serialize(child, value));
+    auto index = rstd::try_from<i64>(index_ + usize(1));
+    if (index.is_err())
+      return Err(child.invalid_value("sequence index out of Lua range"_str));
+    rstd_try(child.set(table_, LuaValue::Integer(*index), encoded));
+    ++index_;
+    return Ok(empty{});
+  }
+  auto end() -> ValueSerializer::result_type {
+    if (ended_)
+      return Err(sink_.invariant("sequence already ended"_str));
+    ended_ = true;
+    return Ok(LuaValue::Table(rstd::move(table_)));
+  }
+};
+
+class ValueMapSerializer {
+  ValueSerializer sink_;
+  TableHandle table_;
+  Option<LuaValue> key_;
+  bool ended_{};
+
+public:
+  using error_type = SerdeError;
+  ValueMapSerializer(ValueSerializer sink, TableHandle table)
+      : sink_(rstd::move(sink)), table_(rstd::move(table)) {}
+  template <class T>
+  auto key(const T &value) -> rstd::Result<empty, SerdeError> {
+    if (ended_)
+      return Err(sink_.invariant("map already ended"_str));
+    if (key_.is_some())
+      return Err(sink_.invariant("map value is missing"_str));
+    auto child = sink_.index(usize());
+    auto key = rstd_try(rstd::serde::serialize(child, value));
+    if (key.is_Nil() ||
+        (key.is_Number() && key.as_Number().value.to_primitive() !=
+                                key.as_Number().value.to_primitive()))
+      return Err(sink_.invalid_value("invalid Lua table key"_str));
+    key_ = Some(rstd::move(key));
+    return Ok(empty{});
+  }
+  template <class T>
+  auto value(const T &value) -> rstd::Result<empty, SerdeError> {
+    if (ended_)
+      return Err(sink_.invariant("map already ended"_str));
+    if (key_.is_none())
+      return Err(sink_.invariant("map key is missing"_str));
+    auto text = key_->as_utf8();
+    auto child = text.is_ok() ? sink_.field(*text) : sink_.index(usize());
+    auto encoded = rstd_try(rstd::serde::serialize(child, value));
+    rstd_try(child.set(table_, *key_, encoded));
+    key_ = None();
+    return Ok(empty{});
+  }
+  auto end() -> ValueSerializer::result_type {
+    if (ended_)
+      return Err(sink_.invariant("map already ended"_str));
+    if (key_.is_some())
+      return Err(sink_.invariant("map value is missing"_str));
+    ended_ = true;
+    return Ok(LuaValue::Table(rstd::move(table_)));
+  }
+};
+
+inline auto ValueSerializer::begin_sequence(usize)
+    -> rstd::Result<ValueSequenceSerializer, SerdeError> {
+  rstd_try(nested());
+  auto result = rstd_try(table(options_.array_metatable));
+  auto sink = child(path_.clone());
+  sink.depth_ = depth_;
+  return Ok(ValueSequenceSerializer(rstd::move(sink), rstd::move(result)));
+}
+inline auto ValueSerializer::begin_map(usize)
+    -> rstd::Result<ValueMapSerializer, SerdeError> {
+  rstd_try(nested());
+  auto result = rstd_try(table(options_.object_metatable));
+  auto sink = child(path_.clone());
+  sink.depth_ = depth_;
+  return Ok(ValueMapSerializer(rstd::move(sink), rstd::move(result)));
+}
+
+static_assert(rstd::serde::Serializer<ValueSerializer>);
 
 class ValueDeserializer;
 class ValueSequenceAccess;
 class ValueMapAccess;
 class ValueEnumAccess;
+class ValueInternalEnumAccess;
 
 class ValueDeserializer {
   const LuaValue &value_;
   DeserializeOptions options_;
   DataPath path_;
   usize depth_{};
+  Option<Vec<LuaValue>> map_keys_;
+  bool map_started_{}, reject_unknown_fields_{};
 
 public:
   using error_type = SerdeError;
@@ -34,9 +311,17 @@ public:
   using enum_type = ValueEnumAccess;
 
   ValueDeserializer(const LuaValue &value, DeserializeOptions options = {},
-                    DataPath path = {}, usize depth = {})
+                    DataPath path = {}, usize depth = {},
+                    Option<Vec<LuaValue>> map_keys = None(),
+                    bool reject_unknown_fields = false)
       : value_(value), options_(options), path_(rstd::move(path)),
-        depth_(depth) {}
+        depth_(depth), map_keys_(rstd::move(map_keys)),
+        reject_unknown_fields_(reject_unknown_fields) {}
+  auto record_unknown_fields(rstd::serde::UnknownFieldPolicy declared) const
+      -> rstd::serde::UnknownFieldPolicy {
+    return reject_unknown_fields_ ? rstd::serde::UnknownFieldPolicy::Reject
+                                  : declared;
+  }
   auto invalid_value(ref<str> text) const -> SerdeError {
     return SerdeError::invalid_value(path_.clone(), text);
   }
@@ -78,6 +363,16 @@ public:
     default:
       return Ok(false);
     }
+  }
+  auto has_metatable(const TableHandle *marker) const
+      -> rstd::Result<bool, SerdeError> {
+    if (!marker || !value_.is_Table())
+      return Ok(false);
+    auto table = rstd_try(host(value_.as_Table().value.clone()));
+    auto meta = rstd_try(host(table.metatable_in_call()));
+    if (meta.is_none())
+      return Ok(false);
+    return host(meta->same_object_in_call(*marker));
   }
   auto deserialize_unit() -> rstd::Result<empty, SerdeError> {
     if (!rstd_try(is_none()))
@@ -131,6 +426,9 @@ public:
   auto begin_sequence() -> rstd::Result<ValueSequenceAccess, SerdeError>;
   auto begin_map() -> rstd::Result<ValueMapAccess, SerdeError>;
   auto begin_enum() -> rstd::Result<ValueEnumAccess, SerdeError>;
+  auto begin_internal_enum(ref<str> tag,
+                           rstd::serde::UnknownFieldPolicy unknown)
+      -> rstd::Result<ValueInternalEnumAccess, SerdeError>;
   auto begin_adjacent_enum(ref<str> tag, ref<str> content,
                            rstd::serde::UnknownFieldPolicy unknown)
       -> rstd::Result<ValueEnumAccess, SerdeError>;
@@ -178,6 +476,7 @@ class ValueMapAccess {
   DataPath path_;
   usize depth_, index_{};
   bool pending_{};
+  friend class ValueDeserializer;
 
 public:
   using error_type = SerdeError;
@@ -249,9 +548,6 @@ public:
   auto unit() -> rstd::Result<empty, SerdeError> {
     if (value_.is_none())
       return Ok(empty{});
-    if (adjacent_)
-      return Err(SerdeError::invalid_value(path_.clone(),
-                                           "unexpected enum payload"_str));
     auto child = ValueDeserializer(*value_, options_, path_.clone(), depth_);
     return child.deserialize_unit();
   }
@@ -267,11 +563,60 @@ public:
   }
 };
 
+class ValueInternalEnumAccess {
+  String variant_;
+  LuaValue value_;
+  Vec<LuaValue> keys_;
+  DeserializeOptions options_;
+  DataPath path_;
+  usize depth_;
+  rstd::serde::UnknownFieldPolicy unknown_;
+  bool consumed_{};
+
+public:
+  using error_type = SerdeError;
+  ValueInternalEnumAccess(String variant, TableHandle table, Vec<LuaValue> keys,
+                          DeserializeOptions options, DataPath path,
+                          usize depth, rstd::serde::UnknownFieldPolicy unknown)
+      : variant_(rstd::move(variant)),
+        value_(LuaValue::Table(rstd::move(table))), keys_(rstd::move(keys)),
+        options_(options), path_(rstd::move(path)), depth_(depth),
+        unknown_(unknown) {}
+  auto variant() const &[[clang::lifetimebound]] -> ref<str> {
+    return variant_.as_str();
+  }
+  auto unit() -> rstd::Result<empty, SerdeError> {
+    if (consumed_)
+      return Err(
+          SerdeError::invariant(path_.clone(), "enum already consumed"_str));
+    consumed_ = true;
+    if (unknown_ == rstd::serde::UnknownFieldPolicy::Reject &&
+        !keys_.is_empty()) {
+      auto source = ValueDeserializer(value_, options_, path_.clone(), depth_);
+      auto name = rstd_try(source.host(keys_[usize()].as_utf8()));
+      return Err(source.unknown_field(name));
+    }
+    return Ok(empty{});
+  }
+  template <class T> auto value() -> rstd::Result<T, SerdeError> {
+    if (consumed_)
+      return Err(
+          SerdeError::invariant(path_.clone(), "enum already consumed"_str));
+    consumed_ = true;
+    auto source = ValueDeserializer(
+        value_, options_, path_.clone(), depth_, Some(rstd::move(keys_)),
+        unknown_ == rstd::serde::UnknownFieldPolicy::Reject);
+    return rstd::serde::deserialize<T>(source);
+  }
+};
+
 inline auto ValueDeserializer::begin_sequence()
     -> rstd::Result<ValueSequenceAccess, SerdeError> {
   if (depth_ >= options_.max_depth)
     return Err(invalid_value("Lua value nesting is too deep"_str));
-  if (!value_.is_Table() || rstd_try(is_none()))
+  if (map_keys_.is_some() || !value_.is_Table() || rstd_try(is_none()))
+    return Err(invalid_value("expected a sequence table"_str));
+  if (rstd_try(has_metatable(options_.object_metatable)))
     return Err(invalid_value("expected a sequence table"_str));
   auto table = rstd_try(host(value_.as_Table().value.clone()));
   auto length = rstd_try(host(table.length()));
@@ -284,10 +629,43 @@ inline auto ValueDeserializer::begin_map()
     return Err(invalid_value("Lua value nesting is too deep"_str));
   if (!value_.is_Table() || rstd_try(is_none()))
     return Err(invalid_value("expected a record table"_str));
+  if (rstd_try(has_metatable(options_.array_metatable)))
+    return Err(invalid_value("expected a record table"_str));
+  if (map_keys_.is_some() && map_started_)
+    return Err(invariant("map already consumed"_str));
   auto table = rstd_try(host(value_.as_Table().value.clone()));
-  auto keys = rstd_try(host(table.keys()));
+  auto keys = map_keys_.is_some() ? rstd::move(*map_keys_)
+                                  : rstd_try(host(table.keys()));
+  map_started_ = true;
   return Ok(ValueMapAccess(rstd::move(table), rstd::move(keys), options_,
                            path_.clone(), depth_ + usize(1)));
+}
+
+inline auto
+ValueDeserializer::begin_internal_enum(ref<str> tag,
+                                       rstd::serde::UnknownFieldPolicy unknown)
+    -> rstd::Result<ValueInternalEnumAccess, SerdeError> {
+  auto map = rstd_try(begin_map());
+  Option<String> variant;
+  Vec<LuaValue> keys;
+  for (auto &key : map.keys_) {
+    auto name = rstd_try(host(key.as_utf8()));
+    if (name == tag) {
+      if (variant.is_some())
+        return Err(duplicate_field(tag));
+      auto value = rstd_try(host(map.table_.get_in_call(key)));
+      auto child = ValueDeserializer(value, options_, path_.with_field(tag),
+                                     depth_ + usize(1));
+      variant = Some(rstd_try(child.deserialize_string()));
+    } else {
+      keys.push(rstd::move(key));
+    }
+  }
+  if (variant.is_none())
+    return Err(missing_field(tag));
+  return Ok(ValueInternalEnumAccess(rstd::move(*variant),
+                                    rstd::move(map.table_), rstd::move(keys),
+                                    options_, path_.clone(), depth_, unknown));
 }
 inline auto ValueDeserializer::begin_enum()
     -> rstd::Result<ValueEnumAccess, SerdeError> {
@@ -313,15 +691,11 @@ ValueDeserializer::begin_adjacent_enum(ref<str> tag, ref<str> content,
                                        rstd::serde::UnknownFieldPolicy unknown)
     -> rstd::Result<ValueEnumAccess, SerdeError> {
   auto map = rstd_try(begin_map());
-  // Retain the Lua payload until the tag is known, independent of table key
-  // order.
-  auto table = rstd_try(host(value_.as_Table().value.clone()));
-  auto keys = rstd_try(host(table.keys()));
   Option<String> variant;
   Option<LuaValue> payload;
-  for (const auto &key : keys) {
+  for (const auto &key : map.keys_) {
     auto name = rstd_try(host(key.as_utf8()));
-    auto value = rstd_try(host(table.get_in_call(key)));
+    auto value = rstd_try(host(map.table_.get_in_call(key)));
     if (name == tag) {
       auto child = ValueDeserializer(value, options_, path_.with_field(tag),
                                      depth_ + usize(1));
@@ -361,10 +735,14 @@ inline auto ValueDeserializer::deserialize_json_value()
       auto table = rstd_try(host(value.clone()));
       auto length = rstd_try(host(table.length()));
       auto keys = rstd_try(host(table.keys()));
-      bool sequence = length > usize();
+      auto marked_array = rstd_try(has_metatable(options_.array_metatable));
+      auto marked_object = rstd_try(has_metatable(options_.object_metatable));
+      bool sequence = marked_array || (!marked_object && length > usize());
       for (const auto &key : keys) {
         if (!key.is_Integer() || key.as_Integer().value < i64(1) ||
             key.as_Integer().value > i64(length.to_primitive())) {
+          if (marked_array)
+            return Err(invalid_value("invalid array table key"_str));
           sequence = false;
           break;
         }
@@ -395,12 +773,16 @@ class SnapshotDeserializer;
 class SnapshotSequenceAccess;
 class SnapshotMapAccess;
 class SnapshotEnumAccess;
+class SnapshotInternalEnumAccess;
 
 class SnapshotDeserializer {
   const Value *value_{};
   const Table *table_{};
   DataPath path_;
   usize depth_{}, max_depth_;
+  bool reject_unknown_fields_{};
+  Option<Vec<usize>> map_indices_;
+  bool map_started_{};
 
 public:
   using error_type = SerdeError;
@@ -409,16 +791,27 @@ public:
   using enum_type = SnapshotEnumAccess;
 
   SnapshotDeserializer(const Value &value, DataPath path = {}, usize depth = {},
-                       usize max_depth = usize(128))
+                       usize max_depth = usize(128),
+                       bool reject_unknown_fields = false,
+                       Option<Vec<usize>> map_indices = None())
       : value_(&value), path_(rstd::move(path)), depth_(depth),
-        max_depth_(max_depth) {
+        max_depth_(max_depth), reject_unknown_fields_(reject_unknown_fields),
+        map_indices_(rstd::move(map_indices)) {
     if (value.is_Table())
       table_ = &*value.as_Table().value;
   }
   SnapshotDeserializer(const Table &table, DataPath path = {}, usize depth = {},
-                       usize max_depth = usize(128))
+                       usize max_depth = usize(128),
+                       bool reject_unknown_fields = false,
+                       Option<Vec<usize>> map_indices = None())
       : table_(&table), path_(rstd::move(path)), depth_(depth),
-        max_depth_(max_depth) {}
+        max_depth_(max_depth), reject_unknown_fields_(reject_unknown_fields),
+        map_indices_(rstd::move(map_indices)) {}
+  auto record_unknown_fields(rstd::serde::UnknownFieldPolicy declared) const
+      -> rstd::serde::UnknownFieldPolicy {
+    return reject_unknown_fields_ ? rstd::serde::UnknownFieldPolicy::Reject
+                                  : declared;
+  }
   auto invalid_value(ref<str> text) const -> SerdeError {
     return SerdeError::invalid_value(path_.clone(), text);
   }
@@ -499,6 +892,9 @@ public:
   auto begin_map() -> rstd::Result<SnapshotMapAccess, SerdeError>;
   auto begin_dictionary() -> rstd::Result<SnapshotMapAccess, SerdeError>;
   auto begin_enum() -> rstd::Result<SnapshotEnumAccess, SerdeError>;
+  auto begin_internal_enum(ref<str> tag,
+                           rstd::serde::UnknownFieldPolicy unknown)
+      -> rstd::Result<SnapshotInternalEnumAccess, SerdeError>;
   auto begin_adjacent_enum(ref<str> tag, ref<str> content,
                            rstd::serde::UnknownFieldPolicy unknown)
       -> rstd::Result<SnapshotEnumAccess, SerdeError>;
@@ -535,23 +931,34 @@ public:
 
 class SnapshotMapAccess {
   slice<TableEntry> entries_;
+  Option<Vec<usize>> indices_;
   DataPath path_;
   usize depth_, max_depth_, index_{};
   bool pending_{};
+  friend class SnapshotDeserializer;
+  auto len() const -> usize {
+    return indices_.is_some() ? indices_->len() : entries_.len();
+  }
+  auto entry_index(usize index) const -> usize {
+    return indices_.is_some() ? (*indices_)[index] : index;
+  }
+  auto entry(usize index) const -> const TableEntry & {
+    return entries_[entry_index(index)];
+  }
 
 public:
   using error_type = SerdeError;
   SnapshotMapAccess(slice<TableEntry> entries, DataPath path, usize depth,
-                    usize max_depth)
-      : entries_(entries), path_(rstd::move(path)), depth_(depth),
-        max_depth_(max_depth) {}
+                    usize max_depth, Option<Vec<usize>> indices = None())
+      : entries_(entries), indices_(rstd::move(indices)),
+        path_(rstd::move(path)), depth_(depth), max_depth_(max_depth) {}
   template <class T> auto next_key() -> rstd::Result<Option<T>, SerdeError> {
     if (pending_)
       return Err(
           SerdeError::invariant(path_.clone(), "map value is missing"_str));
-    if (index_ == entries_.len())
+    if (index_ == len())
       return Ok(None<T>());
-    auto key = Value::String(entries_[index_].key.clone());
+    auto key = Value::String(entry(index_).key.clone());
     auto source = SnapshotDeserializer(key, path_.clone(), depth_, max_depth_);
     auto value = rstd_try(rstd::serde::deserialize<T>(source));
     pending_ = true;
@@ -561,7 +968,7 @@ public:
     if (!pending_)
       return Err(
           SerdeError::invariant(path_.clone(), "map key is missing"_str));
-    const auto &entry = entries_[index_];
+    const auto &entry = this->entry(index_);
     auto source = SnapshotDeserializer(
         entry.value, path_.with_field(entry.key.as_str()), depth_, max_depth_);
     auto value = rstd_try(rstd::serde::deserialize<T>(source));
@@ -578,7 +985,7 @@ public:
     return Ok(empty{});
   }
   auto end() -> rstd::Result<empty, SerdeError> {
-    if (pending_ || index_ != entries_.len())
+    if (pending_ || index_ != len())
       return Err(
           SerdeError::invariant(path_.clone(), "map has unread entries"_str));
     return Ok(empty{});
@@ -593,6 +1000,7 @@ class SnapshotEnumAccess {
   bool adjacent_{};
 
 public:
+  using error_type = SerdeError;
   SnapshotEnumAccess(String variant, const Value *value, DataPath path,
                      usize depth, usize max_depth, bool adjacent = false)
       : variant_(rstd::move(variant)), value_(value), path_(rstd::move(path)),
@@ -601,9 +1009,6 @@ public:
   auto unit() -> rstd::Result<empty, SerdeError> {
     if (value_ == nullptr)
       return Ok(empty{});
-    if (adjacent_)
-      return Err(SerdeError::invalid_value(path_.clone(),
-                                           "unexpected enum payload"_str));
     auto source =
         SnapshotDeserializer(*value_, path_.clone(), depth_, max_depth_);
     return source.deserialize_unit();
@@ -620,10 +1025,57 @@ public:
   }
 };
 
+class SnapshotInternalEnumAccess {
+  String variant_;
+  const Table *table_;
+  Vec<usize> indices_;
+  DataPath path_;
+  usize depth_, max_depth_;
+  rstd::serde::UnknownFieldPolicy unknown_;
+  bool consumed_{};
+
+public:
+  using error_type = SerdeError;
+  SnapshotInternalEnumAccess(String variant, const Table &table,
+                             Vec<usize> indices, DataPath path, usize depth,
+                             usize max_depth,
+                             rstd::serde::UnknownFieldPolicy unknown)
+      : variant_(rstd::move(variant)), table_(&table),
+        indices_(rstd::move(indices)), path_(rstd::move(path)), depth_(depth),
+        max_depth_(max_depth), unknown_(unknown) {}
+  auto variant() const &[[clang::lifetimebound]] -> ref<str> {
+    return variant_.as_str();
+  }
+  auto unit() -> rstd::Result<empty, SerdeError> {
+    if (consumed_)
+      return Err(
+          SerdeError::invariant(path_.clone(), "enum already consumed"_str));
+    consumed_ = true;
+    if (unknown_ == rstd::serde::UnknownFieldPolicy::Reject &&
+        !indices_.is_empty())
+      return Err(SerdeError::unknown_field(
+          path_.clone(), table_->entries()[indices_[usize()]].key.as_str()));
+    return Ok(empty{});
+  }
+  template <class T> auto value() -> rstd::Result<T, SerdeError> {
+    if (consumed_)
+      return Err(
+          SerdeError::invariant(path_.clone(), "enum already consumed"_str));
+    consumed_ = true;
+    auto source = SnapshotDeserializer(
+        *table_, path_.clone(), depth_, max_depth_,
+        unknown_ == rstd::serde::UnknownFieldPolicy::Reject,
+        Some(rstd::move(indices_)));
+    return rstd::serde::deserialize<T>(source);
+  }
+};
+
 inline auto SnapshotDeserializer::begin_sequence()
     -> rstd::Result<SnapshotSequenceAccess, SerdeError> {
   if (depth_ >= max_depth_)
     return Err(invalid_value("Lua value nesting is too deep"_str));
+  if (map_indices_.is_some())
+    return Err(invalid_value("expected a sequence table"_str));
   if (value_ != nullptr && value_->is_Array())
     return Ok(SnapshotSequenceAccess(value_->as_Array().value->values(),
                                      path_.clone(), depth_ + usize(1),
@@ -639,8 +1091,15 @@ inline auto SnapshotDeserializer::begin_map()
     return Err(invalid_value("Lua value nesting is too deep"_str));
   if (table_ == nullptr)
     return Err(invalid_value("expected a record table"_str));
+  if (map_indices_.is_some() && map_started_)
+    return Err(invariant("map already consumed"_str));
+  Option<Vec<usize>> indices;
+  if (map_indices_.is_some())
+    indices = Some(rstd::move(*map_indices_));
+  map_started_ = true;
   return Ok(SnapshotMapAccess(table_->entries(), path_.clone(),
-                              depth_ + usize(1), max_depth_));
+                              depth_ + usize(1), max_depth_,
+                              rstd::move(indices)));
 }
 inline auto SnapshotDeserializer::begin_dictionary()
     -> rstd::Result<SnapshotMapAccess, SerdeError> {
@@ -666,13 +1125,38 @@ inline auto SnapshotDeserializer::begin_enum()
   return Ok(SnapshotEnumAccess(entry.key.clone(), &entry.value, path_.clone(),
                                depth_ + usize(1), max_depth_));
 }
+inline auto SnapshotDeserializer::begin_internal_enum(
+    ref<str> tag, rstd::serde::UnknownFieldPolicy unknown)
+    -> rstd::Result<SnapshotInternalEnumAccess, SerdeError> {
+  auto map = rstd_try(begin_map());
+  Option<String> variant;
+  Vec<usize> indices;
+  for (usize index{}; index < map.len(); ++index) {
+    const auto &entry = map.entry(index);
+    if (entry.key == tag) {
+      if (variant.is_some())
+        return Err(duplicate_field(tag));
+      auto child = SnapshotDeserializer(entry.value, path_.with_field(tag),
+                                        depth_ + usize(1), max_depth_);
+      variant = Some(rstd_try(child.deserialize_string()));
+    } else {
+      indices.push(map.entry_index(index));
+    }
+  }
+  if (variant.is_none())
+    return Err(missing_field(tag));
+  return Ok(SnapshotInternalEnumAccess(rstd::move(*variant), *table_,
+                                       rstd::move(indices), path_.clone(),
+                                       depth_, max_depth_, unknown));
+}
 inline auto SnapshotDeserializer::begin_adjacent_enum(
     ref<str> tag, ref<str> content, rstd::serde::UnknownFieldPolicy unknown)
     -> rstd::Result<SnapshotEnumAccess, SerdeError> {
   auto map = rstd_try(begin_map());
   Option<String> variant;
   const Value *payload = nullptr;
-  for (const auto &entry : table_->entries()) {
+  for (usize index{}; index < map.len(); ++index) {
+    const auto &entry = map.entry(index);
     if (entry.key == tag) {
       auto child = SnapshotDeserializer(entry.value, path_.with_field(tag),
                                         depth_ + usize(1), max_depth_);
@@ -734,9 +1218,11 @@ inline auto SnapshotDeserializer::deserialize_json_value()
   return Err(invalid_value("unsupported Lua value in JSON"_str));
 }
 
-template <class T, class Deserializer>
-auto deserialize_value(Deserializer source) -> Result<T> {
-  auto result = rstd::serde::deserialize<T>(source);
+static_assert(rstd::serde::InternalVariantDeserializer<ValueDeserializer>);
+static_assert(rstd::serde::InternalVariantDeserializer<SnapshotDeserializer>);
+
+template <class T>
+auto serde_result(rstd::Result<T, SerdeError> result) -> Result<T> {
   if (result.is_err()) {
     auto error = rstd::move(result).unwrap_err();
     auto message = rstd::format("{}", error);
@@ -745,6 +1231,28 @@ auto deserialize_value(Deserializer source) -> Result<T> {
                    .with_cause(rstd::move(error)));
   }
   return Ok(rstd::move(result).unwrap());
+}
+
+template <class T, class Deserializer>
+auto deserialize_value(Deserializer source) -> Result<T> {
+  return serde_result(rstd::serde::deserialize<T>(source));
+}
+
+template <class T>
+  requires rstd::serde::Serializable<T>
+auto to_value(State &state, const T &value, SerializeOptions options = {})
+    -> Result<LuaValue> {
+  auto sink = ValueSerializer(state, options);
+  rstd_try(state.validate_value(LuaValue::Nil()));
+  return serde_result(rstd::serde::serialize(sink, value));
+}
+template <class T>
+  requires rstd::serde::Serializable<T>
+auto to_value(CallFrame &frame, const T &value, SerializeOptions options = {})
+    -> Result<LuaValue> {
+  auto sink = ValueSerializer(frame, options);
+  rstd_try(frame.validate_value(LuaValue::Nil()));
+  return serde_result(rstd::serde::serialize(sink, value));
 }
 
 template <class T>

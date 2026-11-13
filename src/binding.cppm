@@ -13,6 +13,7 @@ export namespace luato {
 
 class State;
 class Table;
+class TableHandle;
 class Array;
 class LuaValue;
 class MultiValue;
@@ -357,6 +358,8 @@ public:
   }
   void return_value(OpaqueHandle value) { return_value_(context_, value); }
   auto new_table() -> Result<OpaqueHandle> { return new_table_(context_); }
+  auto create_table() -> Result<TableHandle>;
+  auto validate_value(const LuaValue &value) const -> Result<empty>;
   template <typename T> auto create_userdata(T value) -> Result<UserDataHandle>;
 
   template <typename T>

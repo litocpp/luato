@@ -253,8 +253,8 @@ private:
   auto metatable_impl(bool in_call) -> Result<Option<TableHandle>>;
   auto set_metatable_impl(const TableHandle *value, bool in_call)
       -> Result<empty>;
-  auto set_impl(const LuaValue &key, const LuaValue &value, bool raw)
-      -> Result<empty>;
+  auto set_impl(const LuaValue &key, const LuaValue &value, bool raw,
+                bool in_call = false) -> Result<empty>;
   auto scalar_field_in_call(ref<str> name, bool number) -> Result<LuaValue>;
   void *handle_;
   friend class State;
@@ -318,6 +318,7 @@ public:
   auto module_table(ref<str> module) -> Result<TableHandle>;
   auto globals() -> Result<TableHandle>;
   auto create_table() -> Result<TableHandle>;
+  auto validate_value(const LuaValue &value) const -> Result<empty>;
   template <typename T>
   auto register_userdata(UserDataSpec<T> spec) -> Result<empty>;
   template <typename T>
@@ -1792,9 +1793,25 @@ auto read_lua_argument(void *context, usize index) -> Result<OpaqueHandle> {
   return Ok(OpaqueHandle{new LuaValue(rstd::move(*value))});
 }
 
+int new_lua_table_value(lua_State *lua) {
+  lua_newtable(lua);
+  return 1;
+}
+
 auto new_lua_table(void *context) -> Result<OpaqueHandle> {
   auto *invocation = static_cast<Invocation *>(context);
-  lua_createtable(invocation->lua, 0, 0);
+  if (!lua_checkstack(invocation->lua, 2))
+    return Err(Error::binding("Lua table stack allocation failed"_Str));
+  lua_pushcfunction(invocation->lua, new_lua_table_value);
+  auto status = lua_pcall(invocation->lua, 0, 1, 0);
+  if (status != LUA_OK) {
+    auto error = error_from_top(invocation->lua,
+                                status == LUA_ERRMEM ? ErrorKind::Memory
+                                                     : ErrorKind::Runtime,
+                                "table"_Str);
+    lua_pop(invocation->lua, 1);
+    return Err(rstd::move(error));
+  }
   auto value = read_lua_value(invocation->lua, -1, invocation->owner);
   lua_pop(invocation->lua, 1);
   if (value.is_err())
@@ -3478,6 +3495,27 @@ auto CallFrame::create_userdata(T value) -> Result<UserDataHandle> {
   return Ok(rstd::move(object.as_UserData().value));
 }
 
+auto CallFrame::create_table() -> Result<TableHandle> {
+  auto result = new_table();
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  auto value = take_lua_value(*result);
+  return Ok(rstd::move(value.as_Table().value));
+}
+
+auto CallFrame::validate_value(const LuaValue &value) const -> Result<empty> {
+  return validate_lua_value(value, static_cast<Invocation *>(context_)->owner);
+}
+
+auto State::validate_value(const LuaValue &value) const -> Result<empty> {
+  if (!storage_)
+    return Err(moved_state_error());
+  auto &owner = *static_cast<SharedState *>(storage_);
+  if (owner.as_ptr().as_raw_ptr()->executing)
+    return Err(reentrant_state_error());
+  return validate_lua_value(value, owner);
+}
+
 struct LookupRequest {
   StateStorage *storage;
   ref<str> name;
@@ -3758,20 +3796,7 @@ auto TableHandle::get_in_call(const LuaValue &key) -> Result<LuaValue> {
 
 auto TableHandle::set_in_call(const LuaValue &key, const LuaValue &value)
     -> Result<empty> {
-  if (!handle_)
-    return Err(Error::binding("Lua table handle was moved"_Str));
-  auto &handle = *registry_handle(handle_);
-  auto owner = handle.owner.upgrade();
-  if (!owner)
-    return Err(Error::binding("Lua state was destroyed"_Str));
-  auto *lua = owner.as_ptr().as_raw_ptr()->lua;
-  auto top = lua_gettop(lua);
-  lua_rawgeti(lua, LUA_REGISTRYINDEX, handle.reference);
-  push_lua_value(lua, key);
-  push_lua_value(lua, value);
-  lua_rawset(lua, -3);
-  lua_settop(lua, top);
-  return Ok(empty{});
+  return set_impl(key, value, true, true);
 }
 
 struct ScalarFieldRequest {
@@ -4195,8 +4220,8 @@ auto TableHandle::raw_set(const LuaValue &key, const LuaValue &value)
     -> Result<empty> {
   return set_impl(key, value, true);
 }
-auto TableHandle::set_impl(const LuaValue &key, const LuaValue &value, bool raw)
-    -> Result<empty> {
+auto TableHandle::set_impl(const LuaValue &key, const LuaValue &value, bool raw,
+                           bool in_call) -> Result<empty> {
   if (!handle_)
     return Err(Error::binding("Lua table handle was moved"_Str));
   auto &handle = *registry_handle(handle_);
@@ -4204,7 +4229,7 @@ auto TableHandle::set_impl(const LuaValue &key, const LuaValue &value, bool raw)
   if (!owner)
     return Err(Error::binding("Lua state was destroyed"_Str));
   auto *storage = owner.as_ptr().as_raw_ptr();
-  if (storage->executing)
+  if (!in_call && storage->executing)
     return Err(reentrant_state_error());
   auto valid_key = validate_lua_value(key, owner);
   if (valid_key.is_err())
@@ -4212,26 +4237,33 @@ auto TableHandle::set_impl(const LuaValue &key, const LuaValue &value, bool raw)
   auto valid_value = validate_lua_value(value, owner);
   if (valid_value.is_err())
     return Err(rstd::move(valid_value).unwrap_err());
-  ExecutionGuard guard(*storage);
-  auto *lua = storage->lua;
-  auto top = lua_gettop(lua);
-  ValueLookupRequest request{handle.reference, &key, &value, raw};
-  if (!lua_checkstack(lua, 2))
-    return Err(Error::binding("Lua set stack allocation failed"_Str));
-  lua_pushcfunction(lua, set_lua_value);
-  lua_pushlightuserdata(lua, &request);
-  auto status = lua_pcall(lua, 1, 0, 0);
-  if (status != LUA_OK) {
-    auto error = error_from_top(
-        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
-        "table set"_Str);
-    clear_callback_transients(storage);
+  auto access = [&]() -> Result<empty> {
+    auto *lua = storage->lua;
+    auto top = lua_gettop(lua);
+    ValueLookupRequest request{handle.reference, &key, &value, raw};
+    if (!lua_checkstack(lua, 2))
+      return Err(Error::binding("Lua set stack allocation failed"_Str));
+    lua_pushcfunction(lua, set_lua_value);
+    lua_pushlightuserdata(lua, &request);
+    auto status = lua_pcall(lua, 1, 0, 0);
+    if (status != LUA_OK) {
+      auto error = error_from_top(
+          lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+          "table set"_Str);
+      if (!in_call)
+        clear_callback_transients(storage);
+      lua_settop(lua, top);
+      return Err(rstd::move(error));
+    }
+    if (!in_call)
+      clear_callback_transients(storage);
     lua_settop(lua, top);
-    return Err(rstd::move(error));
-  }
-  clear_callback_transients(storage);
-  lua_settop(lua, top);
-  return Ok(empty{});
+    return Ok(empty{});
+  };
+  if (in_call)
+    return access();
+  ExecutionGuard guard(*storage);
+  return access();
 }
 
 auto same_registry_object(void *left_handle, void *right_handle)

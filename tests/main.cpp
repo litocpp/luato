@@ -3,6 +3,7 @@ import luato;
 auto expect_i18n_contract() -> int;
 auto expect_typed_contract() -> int;
 auto expect_serde_contract() -> int;
+auto expect_serde_write_contract() -> int;
 auto expect_async_contract() -> int;
 auto expect_userdata_contract() -> int;
 
@@ -342,6 +343,8 @@ void expect_script_error(Checks &checks, luato::State &state,
 int main(int argc, char **argv) {
   if (argc == 2 && borrowed_str(argv[1]) == "--serde"_str)
     return expect_serde_contract();
+  if (argc == 2 && borrowed_str(argv[1]) == "--serde-write"_str)
+    return expect_serde_write_contract();
   Checks checks;
   {
     auto table = luato::Table::make();
@@ -715,7 +718,8 @@ int main(int argc, char **argv) {
                 "state should destroy each callback context exactly once");
   auto userdata_failures = expect_userdata_contract();
   return checks.failures == 0 && expect_typed_contract() == 0 &&
-                 expect_async_contract() == 0 && userdata_failures == 0
+                 expect_async_contract() == 0 && userdata_failures == 0 &&
+                 expect_serde_write_contract() == 0
              ? 0
              : 1;
 }
