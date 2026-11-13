@@ -3,6 +3,21 @@ import luato;
 using namespace rstd::prelude;
 using namespace rstd::literals;
 
+struct SnapshotRecord {
+  i32 count;
+  Option<String> label;
+  Vec<i32> numbers;
+};
+constexpr auto rstd_serde_definition(SnapshotRecord *) {
+  using namespace rstd::serde;
+  return RecordDefinition<
+      SnapshotRecord, "SnapshotRecord", Direction::Deserialize,
+      UnknownFieldPolicy::Reject,
+      Member<&SnapshotRecord::count, "count", FieldPolicy::Required, "n">,
+      Member<&SnapshotRecord::label, "label", FieldPolicy::Defaulted>,
+      Member<&SnapshotRecord::numbers, "numbers", FieldPolicy::Defaulted>>{};
+}
+
 template <typename F>
 concept TypedFunction = requires(F f) {
   luato::NativeFunctionSpec::typed(String::make(), rstd::move(f));
@@ -46,6 +61,49 @@ auto expect_typed_contract() -> int {
   int drops = 0;
   int rejected_drops = 0;
   int calls = 0;
+  {
+    auto table = luato::Table::make();
+    (void)table.set("n"_Str, i64(42));
+    (void)table.insert("label"_Str, luato::Value::Nil());
+    (void)table.set("numbers"_Str, luato::Table::make());
+    auto decoded = luato::from_value<SnapshotRecord>(table).unwrap();
+    check(decoded.count == i32(42));
+    check(decoded.label.is_none());
+    check(decoded.numbers.is_empty());
+    (void)table.set("count"_Str, i64(43));
+    auto duplicate = luato::from_value<SnapshotRecord>(table);
+    check(duplicate.is_err() &&
+          duplicate.unwrap_err().message.as_str().contains("duplicate"_str));
+
+    auto missing = luato::from_value<SnapshotRecord>(luato::Table::make());
+    check(missing.is_err() &&
+          missing.unwrap_err().message.as_str().contains("count"_str));
+    auto invalid = luato::Table::make();
+    (void)invalid.set("count"_Str, i64(2147483648LL));
+    check(luato::from_value<SnapshotRecord>(invalid).is_err());
+    auto unknown = luato::Table::make();
+    (void)unknown.set("count"_Str, i64(1));
+    (void)unknown.set("unknown"_Str, true);
+    auto rejected = luato::from_value<SnapshotRecord>(unknown);
+    check(rejected.is_err() &&
+          rejected.unwrap_err().message.as_str().contains("unknown"_str));
+    auto null = luato::Value::Opaque(nullptr);
+    check(luato::from_value<Option<i64>>(null).unwrap().is_none());
+    check(luato::from_value<i64>(null).is_err());
+    auto tagged = luato::Table::make();
+    (void)tagged.set("Ok"_Str, i64(7));
+    auto result = luato::from_value<Result<i64, String>>(tagged).unwrap();
+    check(result.is_ok() && result.unwrap() == i64(7));
+
+    auto values = Vec<luato::Value>::make();
+    values.push(luato::Value::Integer(i64(1)));
+    values.push(luato::Value::Boolean(false));
+    auto array = luato::Value::Array(luato::Array::from(rstd::move(values)));
+    auto bad_element = luato::from_value<Vec<i64>>(array);
+    check(bad_element.is_err() &&
+          bad_element.unwrap_err().message.as_str().contains("[1]"_str));
+    check(luato::from_value<SnapshotRecord>(table, usize()).is_err());
+  }
   {
     auto state = luato::State::create(luato::StateOptions::base()).unwrap();
     auto globals = state.globals().unwrap();
