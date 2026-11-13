@@ -1,3 +1,4 @@
+#include <rstd/enum.hpp>
 import luato;
 
 using namespace rstd::prelude;
@@ -16,6 +17,20 @@ constexpr auto rstd_serde_definition(SnapshotRecord *) {
       Member<&SnapshotRecord::count, "count", FieldPolicy::Required, "n">,
       Member<&SnapshotRecord::label, "label", FieldPolicy::Defaulted>,
       Member<&SnapshotRecord::numbers, "numbers", FieldPolicy::Defaulted>>{};
+}
+
+class TaggedSnapshot {
+  RSTD_ENUM(TaggedSnapshot, (Empty), (Items, (Vec<i32> items;)))
+};
+constexpr auto rstd_serde_definition(TaggedSnapshot::Items_payload *) {
+  using T = TaggedSnapshot::Items_payload;
+  return rstd::serde::NewtypeDefinition<
+      T, "Items", rstd::serde::Direction::Both, &T::items>{};
+}
+constexpr auto rstd_serde_definition(TaggedSnapshot *) {
+  return rstd::serde::AdjacentVariantDefinition<
+      TaggedSnapshot, "TaggedSnapshot", rstd::serde::Direction::Both, "type",
+      "items">{};
 }
 
 template <typename F>
@@ -48,8 +63,105 @@ auto typed_source(ref<str> text) -> luato::LuaModuleSource {
           Vec<u8>::from(text.as_bytes())};
 }
 
-auto expect_typed_contract() -> int {
+auto expect_serde_contract() -> int {
   int failures = 0;
+  int assertion = 0;
+  auto check = [&](bool ok) {
+    ++assertion;
+    if (!ok) {
+      ++failures;
+      __builtin_printf("FAIL: serde assertion %d\n", assertion);
+    }
+  };
+  {
+    auto table = luato::Table::make();
+    (void)table.set("items"_Str, luato::Table::make());
+    (void)table.set("type"_Str, "Items"_Str);
+    auto decoded = luato::from_value<TaggedSnapshot>(table).unwrap();
+    check(decoded.is_Items() && decoded.as_Items().items.is_empty());
+    auto encoded = rstd::json::to_value(decoded).unwrap();
+    check((*encoded.get("type"_str))->as_str().unwrap() == "Items"_str);
+    check((*encoded.get("items"_str))->is_Array());
+    (void)table.set("extra"_Str, true);
+    check(luato::from_value<TaggedSnapshot>(table).is_err());
+    auto unit = luato::Table::make();
+    (void)unit.set("type"_Str, "Empty"_Str);
+    (void)unit.insert("items"_Str, luato::Value::Nil());
+    check(luato::from_value<TaggedSnapshot>(unit).is_err());
+    auto missing = luato::Table::make();
+    (void)missing.set("type"_Str, "Items"_Str);
+    check(luato::from_value<TaggedSnapshot>(missing).is_err());
+    check(luato::from_value<TaggedSnapshot>(luato::Table::make()).is_err());
+
+    auto state = luato::State::create(luato::StateOptions::base()).unwrap();
+    auto values =
+        state
+            .evaluate_entry(typed_source(
+                "local null={}; return null, {items={},type='Items'}, "
+                "{type='Empty'}, "
+                "{type='Empty',items=null}, {type='Items',items={1,false}}, {type='Items',items=null}"_str))
+            .unwrap();
+    luato::DeserializeOptions options{
+        &values.values()[usize()].as_Table().value};
+    check(luato::from_value<TaggedSnapshot>(values.values()[usize(1)], options)
+              .unwrap()
+              .is_Items());
+    check(luato::from_value<TaggedSnapshot>(values.values()[usize(2)], options)
+              .unwrap()
+              .is_Empty());
+    check(luato::from_value<TaggedSnapshot>(values.values()[usize(3)], options)
+              .is_err());
+    auto invalid =
+        luato::from_value<TaggedSnapshot>(values.values()[usize(4)], options);
+    check(invalid.is_err() &&
+          invalid.unwrap_err().message.as_str().contains("items[1]"_str));
+    check(luato::from_value<TaggedSnapshot>(values.values()[usize(5)], options)
+              .is_err());
+  }
+  {
+    using Dictionary = alloc::collections::BTreeMap<String, String>;
+    auto empty = luato::Value::Array(luato::Array::make());
+    check(luato::from_value<Dictionary>(empty).unwrap().is_empty());
+    check(luato::from_value<SnapshotRecord>(empty).is_err());
+    check(luato::from_value<TaggedSnapshot>(empty).is_err());
+    check(luato::from_value<Dictionary>(luato::Table::make())
+              .unwrap()
+              .is_empty());
+    check(luato::from_value<Dictionary>(empty, usize()).is_err());
+    auto fields = luato::Table::make();
+    (void)fields.set("mode"_Str, "all"_Str);
+    auto dictionary = luato::from_value<Dictionary>(fields).unwrap();
+    check(dictionary.len() == usize(1));
+    check(*dictionary.get("mode"_Str).unwrap() == "all"_str);
+    auto invalid_fields = luato::Table::make();
+    (void)invalid_fields.set("mode"_Str, i64(1));
+    auto invalid = luato::from_value<Dictionary>(invalid_fields);
+    check(invalid.is_err() &&
+          invalid.unwrap_err().message.as_str().contains("mode"_str));
+    Vec<luato::Value> items;
+    items.push(luato::Value::String("not-a-map"_Str));
+    auto nonempty = luato::Value::Array(luato::Array::from(rstd::move(items)));
+    check(luato::from_value<Dictionary>(nonempty).is_err());
+    check(luato::from_value<Dictionary>(luato::Value::Nil()).is_err());
+    auto state = luato::State::create(luato::StateOptions::base()).unwrap();
+    auto values = state
+                      .evaluate_entry(typed_source(
+                          "return {}, {mode='all'}, {mode=false}"_str))
+                      .unwrap();
+    check(luato::from_value<Dictionary>(values.values()[usize()])
+              .unwrap()
+              .is_empty());
+    check(luato::from_value<Dictionary>(values.values()[usize(1)])
+              .unwrap()
+              .len() == usize(1));
+    check(luato::from_value<Dictionary>(values.values()[usize(2)]).is_err());
+  }
+  __builtin_printf("serde: %d assertions, %d failures\n", assertion, failures);
+  return failures;
+}
+
+auto expect_typed_contract() -> int {
+  int failures = expect_serde_contract();
   int assertion = 0;
   auto check = [&](bool ok) {
     ++assertion;

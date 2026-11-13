@@ -131,6 +131,9 @@ public:
   auto begin_sequence() -> rstd::Result<ValueSequenceAccess, SerdeError>;
   auto begin_map() -> rstd::Result<ValueMapAccess, SerdeError>;
   auto begin_enum() -> rstd::Result<ValueEnumAccess, SerdeError>;
+  auto begin_adjacent_enum(ref<str> tag, ref<str> content,
+                           rstd::serde::UnknownFieldPolicy unknown)
+      -> rstd::Result<ValueEnumAccess, SerdeError>;
 };
 
 class ValueSequenceAccess {
@@ -232,17 +235,23 @@ class ValueEnumAccess {
   DeserializeOptions options_;
   DataPath path_;
   usize depth_;
+  bool adjacent_{};
 
 public:
   using error_type = SerdeError;
   ValueEnumAccess(String variant, Option<LuaValue> value,
-                  DeserializeOptions options, DataPath path, usize depth)
+                  DeserializeOptions options, DataPath path, usize depth,
+                  bool adjacent = false)
       : variant_(rstd::move(variant)), value_(rstd::move(value)),
-        options_(options), path_(rstd::move(path)), depth_(depth) {}
+        options_(options), path_(rstd::move(path)), depth_(depth),
+        adjacent_(adjacent) {}
   auto variant() const -> ref<str> { return variant_.as_str(); }
   auto unit() -> rstd::Result<empty, SerdeError> {
     if (value_.is_none())
       return Ok(empty{});
+    if (adjacent_)
+      return Err(SerdeError::invalid_value(path_.clone(),
+                                           "unexpected enum payload"_str));
     auto child = ValueDeserializer(*value_, options_, path_.clone(), depth_);
     return child.deserialize_unit();
   }
@@ -251,7 +260,9 @@ public:
       return Err(
           SerdeError::invalid_value(path_.clone(), "missing enum payload"_str));
     auto child = ValueDeserializer(
-        *value_, options_, path_.with_variant(variant_.as_str()), depth_);
+        *value_, options_,
+        adjacent_ ? path_.clone() : path_.with_variant(variant_.as_str()),
+        depth_);
     return rstd::serde::deserialize<T>(child);
   }
 };
@@ -295,6 +306,37 @@ inline auto ValueDeserializer::begin_enum()
   auto value = rstd_try(host(table.get_in_call(keys[usize()])));
   return Ok(ValueEnumAccess(String::make(name), Some(rstd::move(value)),
                             options_, path_.clone(), depth_ + usize(1)));
+}
+
+inline auto
+ValueDeserializer::begin_adjacent_enum(ref<str> tag, ref<str> content,
+                                       rstd::serde::UnknownFieldPolicy unknown)
+    -> rstd::Result<ValueEnumAccess, SerdeError> {
+  auto map = rstd_try(begin_map());
+  // Retain the Lua payload until the tag is known, independent of table key
+  // order.
+  auto table = rstd_try(host(value_.as_Table().value.clone()));
+  auto keys = rstd_try(host(table.keys()));
+  Option<String> variant;
+  Option<LuaValue> payload;
+  for (const auto &key : keys) {
+    auto name = rstd_try(host(key.as_utf8()));
+    auto value = rstd_try(host(table.get_in_call(key)));
+    if (name == tag) {
+      auto child = ValueDeserializer(value, options_, path_.with_field(tag),
+                                     depth_ + usize(1));
+      variant = Some(rstd_try(child.deserialize_string()));
+    } else if (name == content) {
+      payload = Some(rstd::move(value));
+    } else if (unknown == rstd::serde::UnknownFieldPolicy::Reject) {
+      return Err(unknown_field(name));
+    }
+  }
+  if (variant.is_none())
+    return Err(missing_field(tag));
+  return Ok(ValueEnumAccess(rstd::move(*variant), rstd::move(payload), options_,
+                            path_.with_field(content), depth_ + usize(1),
+                            true));
 }
 
 inline auto ValueDeserializer::deserialize_json_value()
@@ -455,7 +497,11 @@ public:
   auto ignore_value() -> rstd::Result<empty, SerdeError> { return Ok(empty{}); }
   auto begin_sequence() -> rstd::Result<SnapshotSequenceAccess, SerdeError>;
   auto begin_map() -> rstd::Result<SnapshotMapAccess, SerdeError>;
+  auto begin_dictionary() -> rstd::Result<SnapshotMapAccess, SerdeError>;
   auto begin_enum() -> rstd::Result<SnapshotEnumAccess, SerdeError>;
+  auto begin_adjacent_enum(ref<str> tag, ref<str> content,
+                           rstd::serde::UnknownFieldPolicy unknown)
+      -> rstd::Result<SnapshotEnumAccess, SerdeError>;
   auto deserialize_json_value() -> rstd::Result<rstd::json::Value, SerdeError>;
 };
 
@@ -544,16 +590,20 @@ class SnapshotEnumAccess {
   const Value *value_;
   DataPath path_;
   usize depth_, max_depth_;
+  bool adjacent_{};
 
 public:
   SnapshotEnumAccess(String variant, const Value *value, DataPath path,
-                     usize depth, usize max_depth)
+                     usize depth, usize max_depth, bool adjacent = false)
       : variant_(rstd::move(variant)), value_(value), path_(rstd::move(path)),
-        depth_(depth), max_depth_(max_depth) {}
+        depth_(depth), max_depth_(max_depth), adjacent_(adjacent) {}
   auto variant() const -> ref<str> { return variant_.as_str(); }
   auto unit() -> rstd::Result<empty, SerdeError> {
     if (value_ == nullptr)
       return Ok(empty{});
+    if (adjacent_)
+      return Err(SerdeError::invalid_value(path_.clone(),
+                                           "unexpected enum payload"_str));
     auto source =
         SnapshotDeserializer(*value_, path_.clone(), depth_, max_depth_);
     return source.deserialize_unit();
@@ -563,7 +613,9 @@ public:
       return Err(
           SerdeError::invalid_value(path_.clone(), "missing enum payload"_str));
     auto source = SnapshotDeserializer(
-        *value_, path_.with_variant(variant_.as_str()), depth_, max_depth_);
+        *value_,
+        adjacent_ ? path_.clone() : path_.with_variant(variant_.as_str()),
+        depth_, max_depth_);
     return rstd::serde::deserialize<T>(source);
   }
 };
@@ -590,6 +642,17 @@ inline auto SnapshotDeserializer::begin_map()
   return Ok(SnapshotMapAccess(table_->entries(), path_.clone(),
                               depth_ + usize(1), max_depth_));
 }
+inline auto SnapshotDeserializer::begin_dictionary()
+    -> rstd::Result<SnapshotMapAccess, SerdeError> {
+  if (depth_ >= max_depth_)
+    return Err(invalid_value("Lua value nesting is too deep"_str));
+  if (value_ != nullptr && value_->is_Array() &&
+      value_->as_Array().value->is_empty())
+    return Ok(
+        SnapshotMapAccess({}, path_.clone(), depth_ + usize(1), max_depth_));
+  return begin_map();
+}
+
 inline auto SnapshotDeserializer::begin_enum()
     -> rstd::Result<SnapshotEnumAccess, SerdeError> {
   if (value_ != nullptr && value_->is_String())
@@ -603,6 +666,30 @@ inline auto SnapshotDeserializer::begin_enum()
   return Ok(SnapshotEnumAccess(entry.key.clone(), &entry.value, path_.clone(),
                                depth_ + usize(1), max_depth_));
 }
+inline auto SnapshotDeserializer::begin_adjacent_enum(
+    ref<str> tag, ref<str> content, rstd::serde::UnknownFieldPolicy unknown)
+    -> rstd::Result<SnapshotEnumAccess, SerdeError> {
+  auto map = rstd_try(begin_map());
+  Option<String> variant;
+  const Value *payload = nullptr;
+  for (const auto &entry : table_->entries()) {
+    if (entry.key == tag) {
+      auto child = SnapshotDeserializer(entry.value, path_.with_field(tag),
+                                        depth_ + usize(1), max_depth_);
+      variant = Some(rstd_try(child.deserialize_string()));
+    } else if (entry.key == content) {
+      payload = &entry.value;
+    } else if (unknown == rstd::serde::UnknownFieldPolicy::Reject) {
+      return Err(unknown_field(entry.key.as_str()));
+    }
+  }
+  if (variant.is_none())
+    return Err(missing_field(tag));
+  return Ok(SnapshotEnumAccess(rstd::move(*variant), payload,
+                               path_.with_field(content), depth_ + usize(1),
+                               max_depth_, true));
+}
+
 inline auto SnapshotDeserializer::deserialize_json_value()
     -> rstd::Result<rstd::json::Value, SerdeError> {
   if (rstd_try(is_none()))

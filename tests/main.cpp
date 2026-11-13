@@ -2,6 +2,7 @@ import luato;
 
 auto expect_i18n_contract() -> int;
 auto expect_typed_contract() -> int;
+auto expect_serde_contract() -> int;
 auto expect_async_contract() -> int;
 
 using namespace rstd::prelude;
@@ -337,7 +338,9 @@ void expect_script_error(Checks &checks, luato::State &state,
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc == 2 && borrowed_str(argv[1]) == "--serde"_str)
+    return expect_serde_contract();
   Checks checks;
   {
     auto table = luato::Table::make();
