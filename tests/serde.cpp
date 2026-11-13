@@ -649,6 +649,28 @@ void callbacks(Checks &checks, luato::State &state,
                 "CallFrame remains usable after allocation failure");
 }
 
+void sequence_reads(Checks &checks, luato::State &state) {
+  for (auto text :
+       array<ref<str>, 5>{"return {[2]=1}"_str, "return {1,nil,3}"_str,
+                          "return {1,extra=2}"_str, "return {[0]=1}"_str,
+                          "return {value=1}"_str}) {
+    auto values = state.evaluate_entry(source(text)).unwrap();
+    checks.error(luato::from_value<Vec<i64>>(values.values()[usize()]),
+                 "sequence table"_str);
+  }
+  for (auto text : array<ref<str>, 2>{"return {}"_str, "return {1,2,3}"_str}) {
+    auto values = state.evaluate_entry(source(text)).unwrap();
+    checks.expect(luato::from_value<Vec<i64>>(values.values()[usize()]).is_ok(),
+                  "accept empty and contiguous sequences");
+  }
+  auto values = state
+                    .evaluate_entry(
+                        source("return {kind='leaf',numbers={1,extra=2}}"_str))
+                    .unwrap();
+  checks.error(luato::from_value<SerdeLeaf>(values.values()[usize()]),
+               "numbers"_str);
+}
+
 void failures(Checks &checks, luato::State &state,
               luato::SerializeOptions options) {
   Vec<u64> numbers;
@@ -710,6 +732,7 @@ auto expect_serde_write_contract() -> int {
   null_options(checks, state, options);
   internal_enums(checks, state, options);
   callbacks(checks, state, options);
+  sequence_reads(checks, state);
   failures(checks, state, options);
   __builtin_printf("serde write: %d assertions, %d failures\n",
                    checks.assertions, checks.failures);

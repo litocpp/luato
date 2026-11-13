@@ -620,6 +620,15 @@ inline auto ValueDeserializer::begin_sequence()
     return Err(invalid_value("expected a sequence table"_str));
   auto table = rstd_try(host(value_.as_Table().value.clone()));
   auto length = rstd_try(host(table.length()));
+  auto keys = rstd_try(host(table.keys()));
+  if (keys.len() != length)
+    return Err(invalid_value("expected a contiguous sequence table"_str));
+  for (const auto &key : keys) {
+    if (!key.is_Integer() || key.as_Integer().value < i64(1) ||
+        key.as_Integer().value >
+            i64(static_cast<long long>(length.to_primitive())))
+      return Err(invalid_value("expected a contiguous sequence table"_str));
+  }
   return Ok(ValueSequenceAccess(rstd::move(table), options_, path_.clone(),
                                 depth_ + usize(1), length));
 }
