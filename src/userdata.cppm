@@ -1,0 +1,288 @@
+export module luato:userdata;
+
+export import :state;
+import rstd;
+
+using namespace rstd::prelude;
+using namespace rstd::literals;
+
+export namespace luato {
+
+template <typename T> struct FromLua {
+  static auto from_lua(LuaValue value) -> Result<T> {
+    if constexpr (rstd::mtp::same_as<T, LuaValue>)
+      return Ok(rstd::move(value));
+    else if constexpr (rstd::mtp::same_as<T, bool>) {
+      if (value.is_Boolean())
+        return Ok(value.as_Boolean().value);
+    } else if constexpr (rstd::mtp::same_as<T, i64>) {
+      if (value.is_Integer())
+        return Ok(value.as_Integer().value);
+    } else if constexpr (rstd::mtp::same_as<T, f64>) {
+      if (value.is_Number())
+        return Ok(value.as_Number().value);
+      if (value.is_Integer())
+        return Ok(f64(value.as_Integer().value.to_primitive()));
+    } else if constexpr (rstd::mtp::same_as<T, String>) {
+      if (value.is_Bytes()) {
+        auto result = String::from_utf8(rstd::move(value.as_Bytes().value));
+        if (result.is_ok())
+          return Ok(rstd::move(*result));
+      }
+    } else if constexpr (rstd::mtp::same_as<T, Vec<u8>>) {
+      if (value.is_Bytes())
+        return Ok(rstd::move(value.as_Bytes().value));
+    } else if constexpr (rstd::mtp::same_as<T, TableHandle>) {
+      if (value.is_Table())
+        return Ok(rstd::move(value.as_Table().value));
+    } else if constexpr (rstd::mtp::same_as<T, FunctionHandle>) {
+      if (value.is_Function())
+        return Ok(rstd::move(value.as_Function().value));
+    } else if constexpr (rstd::mtp::same_as<T, UserDataHandle>) {
+      if (value.is_UserData())
+        return Ok(rstd::move(value.as_UserData().value));
+    } else
+      static_assert(!rstd::mtp::same_as<T, T>, "unsupported Lua conversion");
+    return Err(Error::make(ErrorKind::Type, String::make(),
+                           "Lua argument type mismatch"_Str));
+  }
+};
+
+template <typename T> struct FromLua<Option<T>> {
+  static auto from_lua(LuaValue value) -> Result<Option<T>> {
+    if (value.is_Nil())
+      return Ok(None());
+    auto result = FromLua<T>::from_lua(rstd::move(value));
+    if (result.is_err())
+      return Err(rstd::move(result).unwrap_err());
+    return Ok(Some(rstd::move(*result)));
+  }
+};
+
+template <typename T> struct IntoLua {
+  static auto into_lua(T value) -> LuaValue {
+    if constexpr (rstd::mtp::same_as<T, LuaValue>)
+      return rstd::move(value);
+    else if constexpr (rstd::mtp::same_as<T, bool>)
+      return LuaValue::Boolean(value);
+    else if constexpr (rstd::mtp::same_as<T, i64>)
+      return LuaValue::Integer(value);
+    else if constexpr (rstd::mtp::same_as<T, f64>)
+      return LuaValue::Number(value);
+    else if constexpr (rstd::mtp::same_as<T, String>)
+      return LuaValue::Bytes(rstd::move(value).into_bytes());
+    else if constexpr (rstd::mtp::same_as<T, ref<str>>)
+      return LuaValue::Bytes(Vec<u8>::from(value.as_bytes()));
+    else if constexpr (rstd::mtp::same_as<T, Vec<u8>>)
+      return LuaValue::Bytes(rstd::move(value));
+    else if constexpr (rstd::mtp::same_as<T, TableHandle>)
+      return LuaValue::Table(rstd::move(value));
+    else if constexpr (rstd::mtp::same_as<T, FunctionHandle>)
+      return LuaValue::Function(rstd::move(value));
+    else if constexpr (rstd::mtp::same_as<T, UserDataHandle>)
+      return LuaValue::UserData(rstd::move(value));
+    else
+      static_assert(!rstd::mtp::same_as<T, T>, "unsupported Lua conversion");
+  }
+};
+
+template <typename T> struct IntoLua<Option<T>> {
+  static auto into_lua(Option<T> value) -> LuaValue {
+    if (value.is_none())
+      return LuaValue::Nil();
+    return IntoLua<T>::into_lua(rstd::move(*value));
+  }
+};
+
+template <typename T>
+auto argument(CallFrame &frame, usize index) -> Result<T> {
+  auto value = frame.argument(index);
+  if (value.is_err())
+    return Err(rstd::move(value).unwrap_err());
+  return FromLua<T>::from_lua(take_lua_value(*value));
+}
+
+inline auto return_values(CallFrame &frame, MultiValue values)
+    -> BindingResult {
+  for (auto &value : rstd::move(values).into_values())
+    frame.return_value(OpaqueHandle{new LuaValue(rstd::move(value))});
+  return Ok(usize());
+}
+
+template <typename T>
+auto return_value(CallFrame &frame, T value) -> BindingResult {
+  if constexpr (!rstd::mtp::same_as<T, empty>)
+    frame.return_value(
+        OpaqueHandle{new LuaValue(IntoLua<T>::into_lua(rstd::move(value)))});
+  return Ok(usize());
+}
+
+template <typename T>
+auto return_value(CallFrame &frame, Result<T> value) -> BindingResult {
+  if (value.is_err())
+    return Err(rstd::move(value).unwrap_err());
+  return return_value(frame, rstd::move(*value));
+}
+
+template <typename R> auto from_multi(MultiValue values) -> Result<R> {
+  if constexpr (rstd::mtp::same_as<R, MultiValue>)
+    return Ok(rstd::move(values));
+  else if constexpr (rstd::mtp::same_as<R, empty>) {
+    if (values.is_empty())
+      return Ok(empty{});
+  } else if (values.len() == usize(1)) {
+    auto entries = rstd::move(values).into_values();
+    return FromLua<R>::from_lua(rstd::move(entries[usize()]));
+  }
+  return Err(Error::make(ErrorKind::Type, String::make(),
+                         "unexpected Lua return value count"_Str));
+}
+
+template <typename R, typename... Args>
+auto FunctionHandle::call(Args... args) -> Result<R> {
+  auto values = MultiValue::make();
+  (values.push(IntoLua<Args>::into_lua(rstd::move(args))), ...);
+  auto result = call_values(rstd::move(values));
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  return from_multi<R>(rstd::move(*result));
+}
+
+template <typename R, typename... Args>
+auto FunctionHandle::call_async_typed(Args... args)
+    -> rstd::async::coro<Result<R>> {
+  auto values = MultiValue::make();
+  (values.push(IntoLua<Args>::into_lua(rstd::move(args))), ...);
+  auto task = call_async(rstd::move(values));
+  // call_async owns a cloned function before suspension.
+  return [](rstd::async::coro<Result<MultiValue>> task)
+             -> rstd::async::coro<Result<R>> {
+    auto result = co_await rstd::move(task);
+    if (result.is_err())
+      co_return Err(rstd::move(result).unwrap_err());
+    co_return from_multi<R>(rstd::move(*result));
+  }(rstd::move(task));
+}
+
+} // namespace luato
+
+namespace luato {
+
+template <typename T, typename Signature> struct UserDataMethod;
+
+template <typename T, typename R, typename Self, typename... Args>
+struct UserDataMethod<T, R(Self, Args...)> {
+  static_assert(rstd::mtp::same_as<Self, const T &> ||
+                rstd::mtp::same_as<Self, T &>);
+  using Arguments = rstd::tuple<Option<rstd::mtp::rm_cvf<Args>>...>;
+
+  template <rstd::size_t I = 0>
+  static auto read(CallFrame &frame, Arguments &arguments) -> Result<empty> {
+    if constexpr (I == sizeof...(Args))
+      return Ok(empty{});
+    else {
+      using Arg = rstd::mtp::rm_cvf<
+          typename rstd::mtp::func_traits<R(Args...)>::template argument<I>>;
+      static_assert(!rstd::mtp::is_ref<Arg>);
+      auto value = argument<Arg>(frame, usize(I + 1));
+      if (value.is_err())
+        return Err(rstd::move(value).unwrap_err());
+      rstd::get<I>(arguments) = Some(rstd::move(*value));
+      return read<I + 1>(frame, arguments);
+    }
+  }
+  template <typename F, rstd::size_t... I>
+  static auto invoke(F &function, CallFrame &frame, Self self, Arguments &args,
+                     rstd::mtp::index_sequence<I...>) -> BindingResult {
+    if constexpr (rstd::mtp::is_void<R>) {
+      function(self, rstd::move(*rstd::get<I>(args))...);
+      return Ok(usize());
+    } else
+      return return_value(frame,
+                          function(self, rstd::move(*rstd::get<I>(args))...));
+  }
+  template <typename F> static auto wrap(F &&function) {
+    return [function = rstd::forward<F>(function)](
+               CallFrame &frame) mutable -> BindingResult {
+      if (frame.argument_count() != usize(sizeof...(Args) + 1))
+        return Err(
+            Error::make(ErrorKind::Type, String::make(),
+                        "unexpected userdata method argument count"_Str));
+      auto self = argument<UserDataHandle>(frame, usize());
+      if (self.is_err())
+        return Err(rstd::move(self).unwrap_err());
+      auto args = Arguments{};
+      auto loaded = read(frame, args);
+      if (loaded.is_err())
+        return Err(rstd::move(loaded).unwrap_err());
+      auto call = [&](Self object) -> BindingResult {
+        return invoke(function, frame, object, args,
+                      rstd::mtp::make_index_sequence<sizeof...(Args)>{});
+      };
+      if constexpr (rstd::mtp::same_as<Self, T &>)
+        return self->template with_mut<T>(call);
+      else
+        return self->template with<T>(call);
+    };
+  }
+};
+
+} // namespace luato
+
+export namespace luato {
+
+template <typename T> class UserDataSpec {
+public:
+  explicit UserDataSpec(String name) : methods_(rstd::move(name)) {}
+  template <typename F> void raw_method(String name, F &&function) {
+    methods_.raw_variadic_function(
+        rstd::move(name),
+        [function = rstd::forward<F>(function)](
+            CallFrame &frame) mutable -> BindingResult {
+          auto self = argument<UserDataHandle>(frame, usize());
+          if (self.is_err())
+            return Err(rstd::move(self).unwrap_err());
+          auto matches = self->template is<T>();
+          if (matches.is_err())
+            return Err(rstd::move(matches).unwrap_err());
+          if (!*matches)
+            return Err(Error::make(ErrorKind::Type, String::make(),
+                                   "native userdata type mismatch"_Str));
+          return function(frame);
+        });
+  }
+  template <typename F> void method(String name, F &&function) {
+    using Signature = typename rstd::mtp::func_traits<F>::signature;
+    raw_method(rstd::move(name),
+               UserDataMethod<T, Signature>::wrap(rstd::forward<F>(function)));
+  }
+  template <typename F> void raw_async_method(String name, F &&starter) {
+    methods_.async_values_function(
+        rstd::move(name), variadic_arity,
+        [starter = rstd::forward<F>(starter)](CallFrame &frame) mutable
+            -> Result<rstd::async::coro<Result<MultiValue>>> {
+          auto self = argument<UserDataHandle>(frame, usize());
+          if (self.is_err())
+            return Err(rstd::move(self).unwrap_err());
+          auto matches = self->template is<T>();
+          if (matches.is_err())
+            return Err(rstd::move(matches).unwrap_err());
+          if (!*matches)
+            return Err(Error::make(ErrorKind::Type, String::make(),
+                                   "native userdata type mismatch"_Str));
+          return starter(frame);
+        });
+  }
+
+private:
+  ModuleSpec methods_;
+  friend class State;
+};
+
+template <typename T>
+auto State::register_userdata(UserDataSpec<T> spec) -> Result<empty> {
+  return register_module_table(rstd::move(spec.methods_), None(), None(),
+                               &userdata_type_key<T>);
+}
+
+} // namespace luato

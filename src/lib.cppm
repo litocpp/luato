@@ -7,4 +7,5 @@ export import :error;
 export import :binding;
 export import :module_loader;
 export import :state;
+export import :userdata;
 export import :serde;

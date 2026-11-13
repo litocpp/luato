@@ -4,6 +4,7 @@ auto expect_i18n_contract() -> int;
 auto expect_typed_contract() -> int;
 auto expect_serde_contract() -> int;
 auto expect_async_contract() -> int;
+auto expect_userdata_contract() -> int;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
@@ -712,8 +713,9 @@ int main(int argc, char **argv) {
 
   checks.expect(callback_drops == 2,
                 "state should destroy each callback context exactly once");
+  auto userdata_failures = expect_userdata_contract();
   return checks.failures == 0 && expect_typed_contract() == 0 &&
-                 expect_async_contract() == 0
+                 expect_async_contract() == 0 && userdata_failures == 0
              ? 0
              : 1;
 }

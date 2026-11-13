@@ -99,6 +99,75 @@ struct ExecutionReport {
 class MultiValue;
 class LuaValue;
 struct LuaValueAccess;
+template <typename T> class UserDataSpec;
+
+class UserDataHandle {
+public:
+  UserDataHandle(const UserDataHandle &) = delete;
+  auto operator=(const UserDataHandle &) -> UserDataHandle & = delete;
+  UserDataHandle(UserDataHandle &&other) noexcept;
+  auto operator=(UserDataHandle &&other) noexcept -> UserDataHandle &;
+  ~UserDataHandle();
+  auto clone() const -> Result<UserDataHandle>;
+  auto same_object(const UserDataHandle &other) const -> Result<bool>;
+  template <typename T> auto is() const -> Result<bool> {
+    return is_type(&userdata_type_key<T>);
+  }
+
+  template <typename T, typename F>
+  auto with(F &&function) const
+      -> decltype(function(rstd::declval<const T &>())) {
+    return access<T, false>(rstd::forward<F>(function));
+  }
+  template <typename T, typename F>
+  auto with_mut(F &&function) const
+      -> decltype(function(rstd::declval<T &>())) {
+    return access<T, true>(rstd::forward<F>(function));
+  }
+  template <typename T> auto take() const -> Result<T> {
+    auto pointer = take_erased(&userdata_type_key<T>);
+    if (pointer.is_err())
+      return Err(rstd::move(pointer).unwrap_err());
+    auto owned = Box<T>::from_raw(
+        mut_ptr<T>::from_raw_parts(static_cast<T *>(*pointer)));
+    return Ok(rstd::move(*owned));
+  }
+
+private:
+  template <typename T, bool Mutable, typename F>
+  auto access(F &&function) const -> decltype(function(
+      rstd::declval<rstd::mtp::cond<Mutable, T, const T> &>())) {
+    using Object = rstd::mtp::cond<Mutable, T, const T>;
+    using Output = decltype(function(rstd::declval<Object &>()));
+    static_assert(!rstd::mtp::is_ref<Output>,
+                  "userdata borrows cannot escape the callback");
+    static_assert(!rstd::mtp::is_ref<typename Output::value_type> &&
+                      !rstd::mtp::is_ptr<typename Output::value_type>,
+                  "userdata callbacks must return owned values");
+    struct Context {
+      F &function;
+      Option<Output> output;
+    } context{function, None()};
+    auto result = access_erased(
+        &userdata_type_key<T>, Mutable, &context, +[](void *raw, void *object) {
+          auto &context = *static_cast<Context *>(raw);
+          context.output =
+              Some(context.function(*static_cast<Object *>(object)));
+        });
+    if (result.is_err())
+      return Err(rstd::move(result).unwrap_err());
+    return rstd::move(*context.output);
+  }
+  explicit UserDataHandle(void *handle) noexcept : handle_(handle) {}
+  auto access_erased(const void *type, bool mutable_access, void *context,
+                     void (*invoke)(void *, void *)) const -> Result<empty>;
+  auto take_erased(const void *type) const -> Result<void *>;
+  auto is_type(const void *type) const -> Result<bool>;
+  void reset() noexcept;
+  void *handle_;
+  friend class State;
+  friend struct LuaValueAccess;
+};
 
 class FunctionHandle {
 public:
@@ -119,6 +188,9 @@ public:
       -> rstd::async::coro<Result<MultiValue>>;
   auto call_async_nested(MultiValue arguments)
       -> rstd::async::coro<Result<MultiValue>>;
+  template <typename R, typename... Args> auto call(Args... args) -> Result<R>;
+  template <typename R, typename... Args>
+  auto call_async_typed(Args... args) -> rstd::async::coro<Result<R>>;
 
 private:
   static auto call_async_impl(FunctionHandle handle, MultiValue arguments,
@@ -195,7 +267,8 @@ class LuaValue {
   RSTD_ENUM(LuaValue, (Nil, ()), (Boolean, (bool value;)),
             (Integer, (i64 value;)), (Number, (f64 value;)),
             (Bytes, (Vec<u8> value;)), (Table, (TableHandle value;)),
-            (Function, (FunctionHandle value;)), (Opaque, (const void *value;)))
+            (Function, (FunctionHandle value;)),
+            (UserData, (UserDataHandle value;)), (Opaque, (const void *value;)))
 public:
   LuaValue(const LuaValue &) = delete;
   auto operator=(const LuaValue &) -> LuaValue & = delete;
@@ -245,6 +318,14 @@ public:
   auto module_table(ref<str> module) -> Result<TableHandle>;
   auto globals() -> Result<TableHandle>;
   auto create_table() -> Result<TableHandle>;
+  template <typename T>
+  auto register_userdata(UserDataSpec<T> spec) -> Result<empty>;
+  template <typename T>
+  auto create_userdata(T value) -> Result<UserDataHandle> {
+    return create_userdata_erased(
+        &userdata_type_key<T>, new T(rstd::move(value)),
+        +[](void *object) { delete static_cast<T *>(object); });
+  }
   // Copies tables recursively; empty Lua tables decode as Table, not Array.
   auto snapshot(const LuaValue &value) -> Result<Value>;
   // Lua removes nil table entries; snapshots containing them are rejected.
@@ -266,7 +347,12 @@ private:
   static int dispatch_async(void *lua_state);
   static int dispatch_async_handle(void *lua_state);
   auto register_module_table(ModuleSpec module, Option<String> global_name,
-                             Option<String> native_identity) -> Result<empty>;
+                             Option<String> native_identity,
+                             const void *userdata_type = nullptr)
+      -> Result<empty>;
+  auto create_userdata_erased(const void *type, void *object,
+                              void (*destroy)(void *))
+      -> Result<UserDataHandle>;
   void reset() noexcept;
   auto call_module_impl(ref<str> module, ref<str> function, Array arguments,
                         bool multi) -> Result<Vec<Value>>;
@@ -482,6 +568,8 @@ using SharedState = ::alloc::sync::Arc<StateStorage>;
 
 auto read_lua_value(lua_State *lua, int index, SharedState &owner)
     -> Result<LuaValue>;
+auto validate_lua_value(const LuaValue &value, const SharedState &owner)
+    -> Result<empty>;
 
 char storage_marker;
 
@@ -625,7 +713,67 @@ struct RegistrationRequest {
   lua_CFunction dispatcher;
   lua_CFunction async_dispatcher;
   lua_CFunction async_handle_dispatcher;
+  const void *userdata_type;
 };
+
+char native_userdata_marker;
+
+struct NativeUserData {
+  const void *type{};
+  void *object{};
+  void (*destroy)(void *){};
+  int borrows{};
+};
+
+auto native_userdata(lua_State *lua, int index) -> NativeUserData * {
+  if (lua_type(lua, index) != LUA_TUSERDATA ||
+      lua_rawlen(lua, index) != sizeof(NativeUserData) ||
+      !lua_getmetatable(lua, index))
+    return nullptr;
+  lua_rawgetp(lua, -1, &native_userdata_marker);
+  auto recognized = lua_toboolean(lua, -1) != 0;
+  lua_pop(lua, 2);
+  return recognized ? static_cast<NativeUserData *>(lua_touserdata(lua, index))
+                    : nullptr;
+}
+
+int collect_native_userdata(lua_State *lua) {
+  auto *native = native_userdata(lua, 1);
+  if (native && native->object) {
+    auto *object = rstd::exchange(native->object, nullptr);
+    native->destroy(object);
+  }
+  return 0;
+}
+
+struct UserDataCreation {
+  const void *type;
+  void *object;
+  void (*destroy)(void *);
+  int reference{LUA_NOREF};
+  ~UserDataCreation() {
+    if (object)
+      destroy(object);
+  }
+};
+
+int create_native_userdata(lua_State *lua) {
+  auto &request = *static_cast<UserDataCreation *>(lua_touserdata(lua, 1));
+  lua_rawgetp(lua, LUA_REGISTRYINDEX, request.type);
+  if (!lua_istable(lua, -1))
+    return luaL_error(lua, "native userdata type is not registered");
+  auto metatable = lua_gettop(lua);
+  auto *native = static_cast<NativeUserData *>(
+      lua_newuserdatauv(lua, sizeof(NativeUserData), 0));
+  rstd::ptr_::construct(mut_ptr<NativeUserData>::from_raw_parts(native));
+  lua_pushvalue(lua, metatable);
+  lua_setmetatable(lua, -2);
+  native->type = request.type;
+  native->destroy = request.destroy;
+  native->object = rstd::exchange(request.object, nullptr);
+  request.reference = luaL_ref(lua, LUA_REGISTRYINDEX);
+  return 0;
+}
 
 constexpr int ERROR_TAG = 1;
 constexpr int ERROR_KIND = 2;
@@ -1242,6 +1390,22 @@ int register_module(lua_State *state) {
     lua_rawset(state, module);
   }
 
+  if (request->userdata_type) {
+    lua_createtable(state, 0, 4);
+    auto metatable = lua_gettop(state);
+    lua_pushvalue(state, module);
+    lua_setfield(state, metatable, "__index");
+    lua_pushcfunction(state, collect_native_userdata);
+    lua_setfield(state, metatable, "__gc");
+    lua_pushboolean(state, false);
+    lua_setfield(state, metatable, "__metatable");
+    lua_pushboolean(state, true);
+    lua_rawsetp(state, metatable, &native_userdata_marker);
+    lua_pushvalue(state, metatable);
+    lua_rawsetp(state, LUA_REGISTRYINDEX, request->userdata_type);
+    lua_pop(state, 1);
+  }
+
   if (request->native_identity != nullptr) {
     lua_rawgetp(state, LUA_REGISTRYINDEX,
                 static_cast<void *>(&native_module_marker));
@@ -1638,14 +1802,27 @@ auto new_lua_table(void *context) -> Result<OpaqueHandle> {
   return Ok(OpaqueHandle{new LuaValue(rstd::move(*value))});
 }
 
+auto new_lua_userdata(void *context, const void *type, void *object,
+                      void (*destroy)(void *)) -> Result<OpaqueHandle>;
+
 void raise_handle_value(void *context, OpaqueHandle handle) {
   auto *invocation = static_cast<Invocation *>(context);
-  invocation->raised_handle = Some(take_lua_value(handle));
+  auto value = take_lua_value(handle);
+  auto valid = validate_lua_value(value, invocation->owner);
+  if (valid.is_err())
+    invocation->slot->pending_error = Some(rstd::move(valid).unwrap_err());
+  else
+    invocation->raised_handle = Some(rstd::move(value));
 }
 
 void stage_handle(void *context, OpaqueHandle handle) {
   auto *invocation = static_cast<Invocation *>(context);
-  invocation->handle_returns.push(take_lua_value(handle));
+  auto value = take_lua_value(handle);
+  auto valid = validate_lua_value(value, invocation->owner);
+  if (valid.is_err())
+    invocation->slot->pending_error = Some(rstd::move(valid).unwrap_err());
+  else
+    invocation->handle_returns.push(rstd::move(value));
 }
 
 void stage_nil(void *context) {
@@ -1912,8 +2089,8 @@ auto State::register_native_require_module(
 }
 
 auto State::register_module_table(ModuleSpec module, Option<String> global_name,
-                                  Option<String> native_identity)
-    -> Result<empty> {
+                                  Option<String> native_identity,
+                                  const void *userdata_type) -> Result<empty> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
   auto *storage = state_storage(storage_);
@@ -1921,6 +2098,14 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
     return Err(reentrant_state_error());
   auto *lua = storage->lua;
   auto old_top = lua_gettop(lua);
+  if (userdata_type) {
+    lua_rawgetp(lua, LUA_REGISTRYINDEX, userdata_type);
+    auto registered = !lua_isnil(lua, -1);
+    lua_pop(lua, 1);
+    if (registered)
+      return Err(
+          Error::binding("native userdata type is already registered"_Str));
+  }
 
   if (module.name_.is_empty()) {
     return Err(Error::make(ErrorKind::Binding, String::make(),
@@ -2135,7 +2320,8 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
           module.async_values_functions_.len(),
       dispatcher,
       async_dispatcher,
-      async_handle_dispatcher};
+      async_handle_dispatcher,
+      userdata_type};
 
   if (!lua_checkstack(lua, 2)) {
     storage->callbacks.truncate(first_slot);
@@ -2229,7 +2415,7 @@ int State::dispatch(void *lua_state) {
                            actual, read_i64, read_bool, read_string, read_table,
                            read_array, read_opaque, stage_value, stage_nil,
                            raise_value, read_lua_argument, stage_handle,
-                           new_lua_table, raise_handle_value);
+                           new_lua_table, raise_handle_value, new_lua_userdata);
     auto result = slot->callback->operator()(frame);
     if (result.is_err()) {
       auto error = rstd::move(result).unwrap_err_unchecked();
@@ -2244,6 +2430,10 @@ int State::dispatch(void *lua_state) {
     slot->raised_value = rstd::move(invocation.raised);
   }
 
+  if (slot->pending_error.is_some()) {
+    slot->handle_returns.clear();
+    return raise_pending_error(lua, slot);
+  }
   if (!slot->handle_returns.is_empty()) {
     auto count = slot->handle_returns.len();
     if (!lua_checkstack(lua, static_cast<int>(count.to_primitive()))) {
@@ -2391,7 +2581,7 @@ int State::dispatch_async(void *lua_state) {
                            actual, read_i64, read_bool, read_string, read_table,
                            read_array, read_opaque, stage_value, stage_nil,
                            raise_value, read_lua_argument, stage_handle,
-                           new_lua_table, raise_handle_value);
+                           new_lua_table, raise_handle_value, new_lua_userdata);
     auto started = (**slot->async_starter)(frame);
     if (started.is_err()) {
       auto error = rstd::move(started).unwrap_err();
@@ -2448,7 +2638,7 @@ int State::dispatch_async_handle(void *lua_state) {
                            actual, read_i64, read_bool, read_string, read_table,
                            read_array, read_opaque, stage_value, stage_nil,
                            raise_value, read_lua_argument, stage_handle,
-                           new_lua_table, raise_handle_value);
+                           new_lua_table, raise_handle_value, new_lua_userdata);
     auto start = [slot](auto started) -> AsyncPending * {
       if (started.is_err()) {
         auto error = rstd::move(started).unwrap_err();
@@ -2731,6 +2921,12 @@ struct LuaValueAccess {
   static auto function(void *handle) -> FunctionHandle {
     return FunctionHandle(handle);
   }
+  static auto userdata(void *handle) -> UserDataHandle {
+    return UserDataHandle(handle);
+  }
+  static auto handle(const UserDataHandle &value) -> void * {
+    return value.handle_;
+  }
   static auto handle(const TableHandle &value) -> void * {
     return value.handle_;
   }
@@ -2765,6 +2961,12 @@ auto LuaValue::clone() const -> Result<LuaValue> {
       return Err(rstd::move(copy).unwrap_err());
     return Ok(Function(rstd::move(copy).unwrap()));
   }
+  case Tag::UserData: {
+    auto copy = as_UserData().value.clone();
+    if (copy.is_err())
+      return Err(rstd::move(copy).unwrap_err());
+    return Ok(UserData(rstd::move(*copy)));
+  }
   }
   return Err(Error::binding("invalid Lua value"_Str));
 }
@@ -2793,6 +2995,8 @@ auto validate_lua_value(const LuaValue &value, const SharedState &owner)
     raw = LuaValueAccess::handle(value.as_Table().value);
   else if (value.is_Function())
     raw = LuaValueAccess::handle(value.as_Function().value);
+  else if (value.is_UserData())
+    raw = LuaValueAccess::handle(value.as_UserData().value);
   else
     return Ok(empty{});
   if (!raw)
@@ -2841,6 +3045,12 @@ void push_lua_value(lua_State *lua, const LuaValue &value) {
         registry_handle(LuaValueAccess::handle(value.as_Function().value))
             ->reference);
     return;
+  case LuaValue::Tag::UserData:
+    lua_rawgeti(
+        lua, LUA_REGISTRYINDEX,
+        registry_handle(LuaValueAccess::handle(value.as_UserData().value))
+            ->reference);
+    return;
   }
 }
 
@@ -2877,8 +3087,13 @@ auto read_lua_value(lua_State *lua, int index, SharedState &owner)
   case LUA_TLIGHTUSERDATA:
     return Ok(LuaValue::Opaque(lua_touserdata(lua, index)));
   case LUA_TTABLE:
+  case LUA_TUSERDATA:
   case LUA_TFUNCTION: {
     bool table = lua_istable(lua, index);
+    bool userdata = lua_type(lua, index) == LUA_TUSERDATA;
+    if (userdata && !native_userdata(lua, index))
+      return Err(Error::make(ErrorKind::Type, String::make(),
+                             "unsupported Lua userdata type"_Str));
     if (!lua_checkstack(lua, 3))
       return Err(Error::binding("Lua reference stack allocation failed"_Str));
     int reference = LUA_NOREF;
@@ -2896,6 +3111,8 @@ auto read_lua_value(lua_State *lua, int index, SharedState &owner)
     auto raw = make_registry_handle(owner.clone(), reference);
     if (table)
       return Ok(LuaValue::Table(LuaValueAccess::table(raw)));
+    if (userdata)
+      return Ok(LuaValue::UserData(LuaValueAccess::userdata(raw)));
     return Ok(LuaValue::Function(LuaValueAccess::function(raw)));
   }
   default:
@@ -3081,6 +3298,184 @@ auto FunctionHandle::clone() const -> Result<FunctionHandle> {
 }
 void FunctionHandle::reset() noexcept {
   drop_registry_handle(rstd::exchange(handle_, nullptr));
+}
+
+UserDataHandle::UserDataHandle(UserDataHandle &&other) noexcept
+    : handle_(rstd::exchange(other.handle_, nullptr)) {}
+auto UserDataHandle::operator=(UserDataHandle &&other) noexcept
+    -> UserDataHandle & {
+  if (this != &other) {
+    reset();
+    handle_ = rstd::exchange(other.handle_, nullptr);
+  }
+  return *this;
+}
+UserDataHandle::~UserDataHandle() { reset(); }
+void UserDataHandle::reset() noexcept {
+  drop_registry_handle(rstd::exchange(handle_, nullptr));
+}
+auto UserDataHandle::clone() const -> Result<UserDataHandle> {
+  if (!handle_)
+    return Err(Error::binding("Lua userdata handle was moved"_Str));
+  if (!registry_handle(handle_)->owner.upgrade())
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  return Ok(UserDataHandle(clone_registry_handle(handle_)));
+}
+auto UserDataHandle::same_object(const UserDataHandle &other) const
+    -> Result<bool> {
+  if (!handle_ || !other.handle_)
+    return Err(Error::binding("Lua userdata handle was moved"_Str));
+  auto owner = registry_handle(handle_)->owner.upgrade();
+  auto other_owner = registry_handle(other.handle_)->owner.upgrade();
+  if (!owner || !other_owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  if (!SharedState::ptr_eq(owner, other_owner))
+    return Ok(false);
+  auto *lua = owner.as_ptr().as_raw_ptr()->lua;
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua userdata stack allocation failed"_Str));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, registry_handle(handle_)->reference);
+  lua_rawgeti(lua, LUA_REGISTRYINDEX,
+              registry_handle(other.handle_)->reference);
+  auto equal = lua_rawequal(lua, -1, -2) != 0;
+  lua_pop(lua, 2);
+  return Ok(equal);
+}
+auto referenced_userdata(lua_State *lua, int reference)
+    -> Result<NativeUserData *> {
+  if (!lua_checkstack(lua, 3))
+    return Err(Error::binding("Lua userdata stack allocation failed"_Str));
+  lua_rawgeti(lua, LUA_REGISTRYINDEX, reference);
+  auto *native = native_userdata(lua, -1);
+  lua_pop(lua, 1);
+  if (!native)
+    return Err(Error::binding("invalid native userdata handle"_Str));
+  return Ok(native);
+}
+auto UserDataHandle::is_type(const void *type) const -> Result<bool> {
+  if (!handle_)
+    return Err(Error::binding("Lua userdata handle was moved"_Str));
+  auto owner = registry_handle(handle_)->owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto native = referenced_userdata(owner.as_ptr().as_raw_ptr()->lua,
+                                    registry_handle(handle_)->reference);
+  if (native.is_err())
+    return Err(rstd::move(native).unwrap_err());
+  return Ok((*native)->type == type);
+}
+auto UserDataHandle::access_erased(const void *type, bool mutable_access,
+                                   void *context,
+                                   void (*invoke)(void *, void *)) const
+    -> Result<empty> {
+  if (!handle_)
+    return Err(Error::binding("Lua userdata handle was moved"_Str));
+  auto reference = static_cast<SharedRegistry *>(handle_)->clone();
+  auto owner = reference->owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto found = referenced_userdata(owner.as_ptr().as_raw_ptr()->lua,
+                                   reference->reference);
+  if (found.is_err())
+    return Err(rstd::move(found).unwrap_err());
+  auto *native = *found;
+  if (native->type != type)
+    return Err(Error::make(ErrorKind::Type, String::make(),
+                           "native userdata type mismatch"_Str));
+  if (!native->object)
+    return Err(Error::binding("native userdata was consumed"_Str));
+  if (native->borrows < 0 || (mutable_access && native->borrows != 0))
+    return Err(Error::binding("native userdata is already borrowed"_Str));
+  if (mutable_access)
+    native->borrows = -1;
+  else
+    ++native->borrows;
+  invoke(context, native->object);
+  if (mutable_access)
+    native->borrows = 0;
+  else
+    --native->borrows;
+  return Ok(empty{});
+}
+auto UserDataHandle::take_erased(const void *type) const -> Result<void *> {
+  if (!handle_)
+    return Err(Error::binding("Lua userdata handle was moved"_Str));
+  auto owner = registry_handle(handle_)->owner.upgrade();
+  if (!owner)
+    return Err(Error::binding("Lua state was destroyed"_Str));
+  auto found = referenced_userdata(owner.as_ptr().as_raw_ptr()->lua,
+                                   registry_handle(handle_)->reference);
+  if (found.is_err())
+    return Err(rstd::move(found).unwrap_err());
+  auto *native = *found;
+  if (native->type != type)
+    return Err(Error::make(ErrorKind::Type, String::make(),
+                           "native userdata type mismatch"_Str));
+  if (!native->object)
+    return Err(Error::binding("native userdata was consumed"_Str));
+  if (native->borrows)
+    return Err(Error::binding("native userdata is already borrowed"_Str));
+  return Ok(rstd::exchange(native->object, nullptr));
+}
+
+auto make_userdata_value(lua_State *lua, SharedState &owner, const void *type,
+                         void *object, void (*destroy)(void *))
+    -> Result<LuaValue> {
+  UserDataCreation request{type, object, destroy};
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua userdata stack allocation failed"_Str));
+  auto top = lua_gettop(lua);
+  lua_pushcfunction(lua, create_native_userdata);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 0, 0);
+  if (status != LUA_OK) {
+    auto error = error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Binding,
+        "userdata"_Str);
+    lua_settop(lua, top);
+    return Err(rstd::move(error));
+  }
+  return Ok(LuaValue::UserData(LuaValueAccess::userdata(
+      make_registry_handle(owner.clone(), request.reference))));
+}
+auto new_lua_userdata(void *context, const void *type, void *object,
+                      void (*destroy)(void *)) -> Result<OpaqueHandle> {
+  auto &invocation = *static_cast<Invocation *>(context);
+  auto result = make_userdata_value(invocation.lua, invocation.owner, type,
+                                    object, destroy);
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  return Ok(OpaqueHandle{new LuaValue(rstd::move(*result))});
+}
+auto State::create_userdata_erased(const void *type, void *object,
+                                   void (*destroy)(void *))
+    -> Result<UserDataHandle> {
+  if (!storage_) {
+    destroy(object);
+    return Err(moved_state_error());
+  }
+  auto owner = static_cast<SharedState *>(storage_)->clone();
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing) {
+    destroy(object);
+    return Err(reentrant_state_error());
+  }
+  ExecutionGuard guard(*storage);
+  auto result = make_userdata_value(storage->lua, owner, type, object, destroy);
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  return Ok(rstd::move(result->as_UserData().value));
+}
+
+template <typename T>
+auto CallFrame::create_userdata(T value) -> Result<UserDataHandle> {
+  auto result = new_userdata_(
+      context_, &userdata_type_key<T>, new T(rstd::move(value)),
+      +[](void *object) { delete static_cast<T *>(object); });
+  if (result.is_err())
+    return Err(rstd::move(result).unwrap_err());
+  auto object = take_lua_value(*result);
+  return Ok(rstd::move(object.as_UserData().value));
 }
 
 struct LookupRequest {

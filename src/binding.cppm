@@ -17,6 +17,9 @@ class Array;
 class LuaValue;
 class MultiValue;
 class CallFrame;
+class UserDataHandle;
+
+template <typename T> inline const unsigned char userdata_type_key = 0;
 
 struct OpaqueHandle {
   const void *identity{};
@@ -354,6 +357,7 @@ public:
   }
   void return_value(OpaqueHandle value) { return_value_(context_, value); }
   auto new_table() -> Result<OpaqueHandle> { return new_table_(context_); }
+  template <typename T> auto create_userdata(T value) -> Result<UserDataHandle>;
 
   template <typename T>
     requires(rstd::mtp::same_as<T, i64> || rstd::mtp::same_as<T, bool> ||
@@ -409,20 +413,22 @@ private:
   using ReturnValue = void (*)(void *, OpaqueHandle);
   using NewTable = auto (*)(void *) -> Result<OpaqueHandle>;
   using RaiseHandle = void (*)(void *, OpaqueHandle);
+  using NewUserData = auto (*)(void *, const void *, void *, void (*)(void *))
+      -> Result<OpaqueHandle>;
 
   CallFrame(void *context, usize argument_count, ReadI64 read_i64,
             ReadBool read_bool, ReadString read_string, ReadTable read_table,
             ReadArray read_array, ReadOpaque read_opaque, PushValue push_value,
             PushNil push_nil, RaiseValue raise_value, ReadValue read_value,
             ReturnValue return_value, NewTable new_table,
-            RaiseHandle raise_handle) noexcept
+            RaiseHandle raise_handle, NewUserData new_userdata) noexcept
       : context_(context), argument_count_(argument_count), read_i64_(read_i64),
         read_bool_(read_bool), read_string_(read_string),
         read_table_(read_table), read_array_(read_array),
         read_opaque_(read_opaque), push_value_(push_value), push_nil_(push_nil),
         raise_value_(raise_value), read_value_(read_value),
         return_value_(return_value), new_table_(new_table),
-        raise_handle_(raise_handle) {}
+        raise_handle_(raise_handle), new_userdata_(new_userdata) {}
 
   void *context_;
   usize argument_count_;
@@ -439,6 +445,7 @@ private:
   ReturnValue return_value_;
   NewTable new_table_;
   RaiseHandle raise_handle_;
+  NewUserData new_userdata_;
 
   friend class State;
 };
