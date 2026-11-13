@@ -403,6 +403,21 @@ public:
     raw_method(rstd::move(name),
                UserDataMethod<T, Signature>::wrap(rstd::forward<F>(function)));
   }
+  template <typename F> void raw_field_get(String name, F &&function) {
+    field_names_.push(name.clone());
+    raw_method(rstd::move(name), rstd::forward<F>(function));
+  }
+  template <typename F> void field_get(String name, F &&function) {
+    using Traits = rstd::mtp::func_traits<F>;
+    using Signature = typename Traits::signature;
+    static_assert(Traits::arity == 1,
+                  "userdata field getters only accept the receiver");
+    static_assert(
+        rstd::mtp::same_as<typename Traits::template argument<0>, const T &>,
+        "userdata field getters borrow a const receiver");
+    raw_field_get(rstd::move(name), UserDataMethod<T, Signature>::wrap(
+                                        rstd::forward<F>(function)));
+  }
   template <typename F> void raw_async_method(String name, F &&starter) {
     methods_.async_values_function(
         rstd::move(name), variadic_arity,
@@ -435,13 +450,15 @@ public:
 
 private:
   ModuleSpec methods_;
+  Vec<String> field_names_;
   friend class State;
 };
 
 template <typename T>
 auto State::register_userdata(UserDataSpec<T> spec) -> Result<empty> {
   return register_module_table(rstd::move(spec.methods_), None(), None(),
-                               &userdata_type_key<T>);
+                               &userdata_type_key<T>,
+                               rstd::move(spec.field_names_));
 }
 
 } // namespace luato

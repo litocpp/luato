@@ -351,8 +351,8 @@ private:
   static int restore_async(void *lua_state, void *operation);
   auto register_module_table(ModuleSpec module, Option<String> global_name,
                              Option<String> native_identity,
-                             const void *userdata_type = nullptr)
-      -> Result<empty>;
+                             const void *userdata_type = nullptr,
+                             Vec<String> field_getters = {}) -> Result<empty>;
   auto create_userdata_erased(const void *type, void *object,
                               void (*destroy)(void *))
       -> Result<UserDataHandle>;
@@ -734,6 +734,8 @@ struct RegistrationRequest {
   lua_CFunction async_dispatcher;
   lua_CFunction async_handle_dispatcher;
   const void *userdata_type;
+  const String *field_getters;
+  usize getter_count;
 };
 
 char native_userdata_marker;
@@ -1376,6 +1378,20 @@ int bootstrap_state(lua_State *state) {
   return 0;
 }
 
+int native_userdata_index(lua_State *state) {
+  lua_pushvalue(state, 2);
+  lua_rawget(state, lua_upvalueindex(2));
+  if (!lua_isnil(state, -1)) {
+    lua_pushvalue(state, 1);
+    lua_call(state, 1, 1);
+    return 1;
+  }
+  lua_pop(state, 1);
+  lua_pushvalue(state, 2);
+  lua_rawget(state, lua_upvalueindex(1));
+  return 1;
+}
+
 int register_module(lua_State *state) {
   auto *request = static_cast<RegistrationRequest *>(lua_touserdata(state, 1));
   auto field_capacity = request->slot_count + request->field_count;
@@ -1384,6 +1400,11 @@ int register_module(lua_State *state) {
     return luaL_error(state, "module has too many fields");
   lua_createtable(state, 0, rstd::move(capacity).unwrap_unchecked());
   auto module = lua_gettop(state);
+  int getters = 0;
+  if (request->userdata_type) {
+    lua_createtable(state, 0, 0);
+    getters = lua_gettop(state);
+  }
 
   for (auto index = usize(); index < request->field_count; ++index) {
     auto &field = request->fields[index.to_primitive()];
@@ -1397,6 +1418,10 @@ int register_module(lua_State *state) {
   for (auto offset = usize(); offset < request->slot_count; ++offset) {
     auto *slot =
         request->storage->callbacks[request->first_slot + offset].get();
+    auto destination = module;
+    for (auto index = usize(); index < request->getter_count; ++index)
+      if (request->field_getters[index.to_primitive()] == slot->name.as_str())
+        destination = getters;
     push_string(state, slot->name);
     lua_pushlightuserdata(state, static_cast<void *>(slot));
     lua_pushcclosure(state,
@@ -1407,14 +1432,21 @@ int register_module(lua_State *state) {
                                 ? request->async_handle_dispatcher
                                 : request->dispatcher),
                      1);
-    lua_rawset(state, module);
+    lua_rawset(state, destination);
   }
 
   if (request->userdata_type) {
-    lua_createtable(state, 0, 4);
+    lua_createtable(state, 0, 5);
     auto metatable = lua_gettop(state);
     lua_pushvalue(state, module);
+    lua_pushvalue(state, getters);
+    lua_pushcclosure(state, native_userdata_index, 2);
     lua_setfield(state, metatable, "__index");
+    lua_pushcfunction(
+        state, +[](lua_State *lua) -> int {
+          return luaL_error(lua, "native userdata fields are read-only");
+        });
+    lua_setfield(state, metatable, "__newindex");
     lua_pushcfunction(state, collect_native_userdata);
     lua_setfield(state, metatable, "__gc");
     lua_pushboolean(state, false);
@@ -2126,7 +2158,8 @@ auto State::register_native_require_module(
 
 auto State::register_module_table(ModuleSpec module, Option<String> global_name,
                                   Option<String> native_identity,
-                                  const void *userdata_type) -> Result<empty> {
+                                  const void *userdata_type,
+                                  Vec<String> field_getters) -> Result<empty> {
   if (storage_ == nullptr)
     return Err(moved_state_error());
   auto *storage = state_storage(storage_);
@@ -2357,7 +2390,9 @@ auto State::register_module_table(ModuleSpec module, Option<String> global_name,
       dispatcher,
       async_dispatcher,
       async_handle_dispatcher,
-      userdata_type};
+      userdata_type,
+      field_getters.data(),
+      field_getters.len()};
 
   if (!lua_checkstack(lua, 2)) {
     storage->callbacks.truncate(first_slot);

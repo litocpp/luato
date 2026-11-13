@@ -130,6 +130,89 @@ void collect(Checks &checks, luato::State &state) {
             "collect native userdata");
 }
 
+void fields_and_methods(Checks &checks) {
+  auto state = luato::State::create(luato::StateOptions::base()).unwrap();
+  auto other = luato::State::create(luato::StateOptions::base()).unwrap();
+  checks.ok(other.register_userdata(counter_spec()),
+            "register foreign getter type");
+  auto foreign = other.create_userdata(Counter{i64(8)}).unwrap();
+  auto spec = counter_spec();
+  spec.field_get("value"_Str,
+                 [](const Counter &counter) { return counter.value; });
+  spec.field_get("empty"_Str,
+                 [](const Counter &) -> Option<i64> { return None(); });
+  spec.field_get("broken"_Str, [](const Counter &) -> luato::Result<i64> {
+    return Err(luato::Error::make(luato::ErrorKind::Type, "getter"_Str,
+                                  "getter rejected"_Str));
+  });
+  spec.raw_field_get("foreign"_Str, [&foreign](luato::CallFrame &frame) {
+    return luato::return_value(frame, foreign.clone());
+  });
+  spec.raw_field_get("large"_Str, [](luato::CallFrame &frame) {
+    auto text = String::make();
+    for (usize index{}; index < usize(131072); ++index)
+      text.push_ascii('x');
+    return luato::return_value(frame, rstd::move(text));
+  });
+  checks.ok(state.register_userdata(rstd::move(spec)),
+            "register native field getters");
+  auto handle = state.create_userdata(Counter{i64(4)}).unwrap();
+  auto read = function(state, R"(
+return function(value)
+  assert(value.value == 4 and value:read() == 4)
+  value:add(3)
+  assert(value.value == 7 and value.empty == nil and value.missing == nil)
+  assert(getmetatable(value) == false)
+  assert(not pcall(function() value.value = 1 end))
+  assert(not pcall(function() value.read = function() end end))
+  assert(not pcall(function() value.new_field = 1 end))
+  return value.value
+end
+)"_str);
+  auto result = read.call<i64>(handle.clone().unwrap());
+  checks.expect(result.is_ok() && *result == i64(7),
+                "fields stay live readonly and coexist with methods");
+  auto broken =
+      function(state, "return function(value) return value.broken end"_str);
+  auto rejected = broken.call<i64>(handle.clone().unwrap());
+  checks.error(rejected, luato::ErrorKind::Type,
+               "getter preserves native error kind");
+  auto wrong =
+      function(state, "return function(value) return value.foreign end"_str);
+  checks.error(wrong.call<luato::LuaValue>(handle.clone().unwrap()),
+               luato::ErrorKind::Binding, "getter rejects foreign VM output");
+  auto large =
+      function(state, "return function(value) return value.large end"_str);
+  state.set_memory_limit(state.used_memory().unwrap() + usize(8192)).unwrap();
+  auto exhausted = large.call<luato::LuaValue>(handle.clone().unwrap());
+  state.set_memory_limit(usize()).unwrap();
+  checks.error(exhausted, luato::ErrorKind::Memory,
+               "getter result allocation stays protected");
+  auto again =
+      function(state, "return function(value) return value.value end"_str);
+  checks.expect(again.call<i64>(handle.clone().unwrap()).unwrap() == i64(7),
+                "getter VM recovers after allocation failure");
+  auto occupied = luato::UserDataSpec<OtherCounter>("Duplicate"_Str);
+  occupied.field_get("same"_Str,
+                     [](const OtherCounter &value) { return value.value; });
+  occupied.method("same"_Str,
+                  [](const OtherCounter &value) { return value.value; });
+  checks.error(state.register_userdata(rstd::move(occupied)),
+               luato::ErrorKind::Binding,
+               "getter and method names cannot collide");
+  checks.ok(state.register_userdata(
+                luato::UserDataSpec<OtherCounter>("Recovered"_Str)),
+            "failed getter registration leaves type available");
+  auto borrowing =
+      handle.with_mut<Counter>([&](Counter &) -> luato::Result<empty> {
+        checks.error(again.call<i64>(handle.clone().unwrap()),
+                     luato::ErrorKind::Binding,
+                     "getter cannot bypass an exclusive native borrow");
+        return Ok(empty{});
+      });
+  checks.ok(borrowing, "getter borrow failure releases the outer borrow");
+}
+
 void registration_and_methods(Checks &checks) {
   int rejected_drops{};
   auto state = luato::State::create(luato::StateOptions::base()).unwrap();
@@ -928,6 +1011,7 @@ end
 auto expect_userdata_contract() -> int {
   Checks checks;
   registration_and_methods(checks);
+  fields_and_methods(checks);
   borrows_and_take(checks);
   destruction_and_gc(checks);
   destroyed_vm(checks);
