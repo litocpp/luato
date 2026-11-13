@@ -5,8 +5,16 @@ import rstd;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
+using alloc::rc::make_rc;
+using alloc::rc::Rc;
 
 export namespace luato {
+
+template <typename T> struct Variadic {
+  Vec<T> values;
+};
+
+enum class AsyncMethodErrorKind { Arguments, Execution, Return };
 
 template <typename T> struct FromLua {
   static auto from_lua(LuaValue value) -> Result<T> {
@@ -170,6 +178,145 @@ namespace luato {
 
 template <typename T, typename Signature> struct UserDataMethod;
 
+template <typename T> struct OptionalArgument {
+  static constexpr bool value = false;
+};
+template <typename T> struct OptionalArgument<Option<T>> {
+  static constexpr bool value = true;
+};
+template <typename T> struct VariadicArgument {
+  static constexpr bool value = false;
+};
+template <typename T> struct VariadicArgument<Variadic<T>> {
+  static constexpr bool value = true;
+  using type = T;
+};
+struct IgnoreAsyncMethodError {
+  void operator()(const UserDataHandle &, const Error &,
+                  AsyncMethodErrorKind) const {}
+};
+
+template <typename T, typename Signature> struct UserDataAsyncMethod;
+template <typename T, typename C, typename Self, typename... Args>
+struct UserDataAsyncMethod<T, C(Self, Args...)> {
+  static_assert(rstd::mtp::same_as<Self, UserDataHandle>,
+                "async userdata methods own their userdata handle");
+  static_assert((!rstd::mtp::is_ref<Args> && ...),
+                "async userdata arguments must be owned");
+  using R = typename AsyncReturnOf<C>::type;
+  using Arguments = rstd::tuple<Option<Args>...>;
+
+  template <typename F, typename Failure> struct Method {
+    F function;
+    Failure failure;
+  };
+  template <rstd::size_t I = 0>
+  static auto read(CallFrame &frame, Arguments &arguments) -> Result<empty> {
+    if constexpr (I == sizeof...(Args)) {
+      if (frame.argument_count() > usize(sizeof...(Args) + 1) &&
+          !(VariadicArgument<Args>::value || ...))
+        return Err(
+            Error::make(ErrorKind::Type, String::make(),
+                        "unexpected userdata method argument count"_Str));
+      return Ok(empty{});
+    } else {
+      using Arg =
+          typename rstd::mtp::func_traits<void(Args...)>::template argument<I>;
+      if constexpr (VariadicArgument<Arg>::value) {
+        static_assert(I + 1 == sizeof...(Args),
+                      "variadic argument must be last");
+        Arg values;
+        for (auto index = usize(I + 1); index < frame.argument_count();
+             ++index) {
+          auto value =
+              argument<typename VariadicArgument<Arg>::type>(frame, index);
+          if (value.is_err())
+            return Err(rstd::move(value).unwrap_err());
+          values.values.push(rstd::move(*value));
+        }
+        rstd::get<I>(arguments) = Some(rstd::move(values));
+      } else if (frame.argument_count() <= usize(I + 1)) {
+        if constexpr (OptionalArgument<Arg>::value)
+          rstd::get<I>(arguments) = Some(Arg{});
+        else
+          return Err(
+              Error::make(ErrorKind::Type, String::make(),
+                          "unexpected userdata method argument count"_Str));
+      } else {
+        auto value = argument<Arg>(frame, usize(I + 1));
+        if (value.is_err())
+          return Err(rstd::move(value).unwrap_err());
+        rstd::get<I>(arguments) = Some(rstd::move(*value));
+      }
+      return read<I + 1>(frame, arguments);
+    }
+  }
+  static auto finish(R value) -> AsyncReturn {
+    if constexpr (rstd::mtp::same_as<R, AsyncReturn>)
+      return rstd::move(value);
+    else if constexpr (rstd::mtp::same_as<R, MultiValue>)
+      return AsyncReturn::values(rstd::move(value));
+    else
+      return AsyncReturn::make(
+          [value = rstd::move(value)](CallFrame &frame) mutable {
+            if constexpr (!rstd::mtp::same_as<R, empty>) {
+              auto output = IntoLua<R>::into_lua(rstd::move(value));
+              auto valid = frame.validate_value(output);
+              if (valid.is_err())
+                return BindingResult(Err(rstd::move(valid).unwrap_err()));
+              return return_value(frame, rstd::move(output));
+            } else {
+              return return_value(frame, rstd::move(value));
+            }
+          });
+  }
+  template <typename M, rstd::size_t... I>
+  static auto run(Rc<M> method, UserDataHandle self, Arguments arguments,
+                  rstd::mtp::index_sequence<I...>)
+      -> rstd::async::coro<Result<AsyncReturn>> {
+    auto receiver = self.clone();
+    if (receiver.is_err()) {
+      method.get()->failure(self, receiver.as_ref().unwrap_err(),
+                            AsyncMethodErrorKind::Arguments);
+      co_return Err(rstd::move(receiver).unwrap_err());
+    }
+    auto result = co_await method.get()->function(
+        rstd::move(*receiver), rstd::move(*rstd::get<I>(arguments))...);
+    if (result.is_err()) {
+      method.get()->failure(self, result.as_ref().unwrap_err(),
+                            AsyncMethodErrorKind::Execution);
+      co_return Err(rstd::move(result).unwrap_err());
+    }
+    co_return Ok(
+        rstd::move(finish(rstd::move(*result)))
+            .on_error([method = rstd::move(method),
+                       self = rstd::move(self)](const Error &error) mutable {
+              method.get()->failure(self, error, AsyncMethodErrorKind::Return);
+            }));
+  }
+  template <typename F, typename Failure>
+  static auto wrap(F &&function, Failure &&failure) {
+    using M = Method<rstd::mtp::decay<F>, rstd::mtp::decay<Failure>>;
+    auto method = make_rc<M>(
+        M{rstd::forward<F>(function), rstd::forward<Failure>(failure)});
+    return [method = rstd::move(method)](CallFrame &frame) mutable
+               -> Result<rstd::async::coro<Result<AsyncReturn>>> {
+      auto self = argument<UserDataHandle>(frame, usize());
+      if (self.is_err())
+        return Err(rstd::move(self).unwrap_err());
+      auto arguments = Arguments{};
+      auto loaded = read(frame, arguments);
+      if (loaded.is_err()) {
+        method.get()->failure(*self, loaded.as_ref().unwrap_err(),
+                              AsyncMethodErrorKind::Arguments);
+        return Err(rstd::move(loaded).unwrap_err());
+      }
+      return Ok(run(method.clone(), rstd::move(*self), rstd::move(arguments),
+                    rstd::mtp::make_index_sequence<sizeof...(Args)>{}));
+    };
+  }
+};
+
 template <typename T, typename R, typename Self, typename... Args>
 struct UserDataMethod<T, R(Self, Args...)> {
   static_assert(rstd::mtp::same_as<Self, const T &> ||
@@ -259,8 +406,8 @@ public:
   template <typename F> void raw_async_method(String name, F &&starter) {
     methods_.async_values_function(
         rstd::move(name), variadic_arity,
-        [starter = rstd::forward<F>(starter)](CallFrame &frame) mutable
-            -> Result<rstd::async::coro<Result<MultiValue>>> {
+        [starter = rstd::forward<F>(starter)](
+            CallFrame &frame) mutable -> decltype(starter(frame)) {
           auto self = argument<UserDataHandle>(frame, usize());
           if (self.is_err())
             return Err(rstd::move(self).unwrap_err());
@@ -272,6 +419,18 @@ public:
                                    "native userdata type mismatch"_Str));
           return starter(frame);
         });
+  }
+
+  template <typename F, typename Failure>
+  void async_method(String name, F &&function, Failure &&failure) {
+    using Signature = typename rstd::mtp::func_traits<F>::signature;
+    raw_async_method(rstd::move(name), UserDataAsyncMethod<T, Signature>::wrap(
+                                           rstd::forward<F>(function),
+                                           rstd::forward<Failure>(failure)));
+  }
+  template <typename F> void async_method(String name, F &&function) {
+    async_method(rstd::move(name), rstd::forward<F>(function),
+                 IgnoreAsyncMethodError{});
   }
 
 private:

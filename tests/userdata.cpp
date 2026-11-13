@@ -680,19 +680,11 @@ void async_typed_and_cancel(Checks &checks) {
   Gate gate;
   auto state = luato::State::create(luato::StateOptions::base()).unwrap();
   auto spec = counter_spec();
-  spec.raw_async_method(
-      "wait"_Str,
-      [&gate](luato::CallFrame &frame)
-          -> luato::Result<
-              rstd::async::coro<luato::Result<luato::MultiValue>>> {
-        auto self = luato::argument<luato::UserDataHandle>(frame, usize());
-        if (self.is_err())
-          return Err(rstd::move(self).unwrap_err());
-        auto amount = luato::argument<i64>(frame, usize(1));
-        if (amount.is_err())
-          return Err(rstd::move(amount).unwrap_err());
-        return Ok(wait_owned(gate, rstd::move(*self), *amount));
-      });
+  spec.async_method("wait"_Str,
+                    [&gate](luato::UserDataHandle self, i64 amount)
+                        -> rstd::async::coro<luato::Result<luato::MultiValue>> {
+                      return wait_owned(gate, rstd::move(self), amount);
+                    });
   if (!checks.ok(state.register_userdata(rstd::move(spec)),
                  "register async userdata method"))
     return;
@@ -729,6 +721,208 @@ void async_typed_and_cancel(Checks &checks) {
             "VM remains usable after typed async cancellation and completion");
 }
 
+struct AsyncPayload {
+  i64 value;
+  Vec<String> labels;
+};
+constexpr auto rstd_serde_definition(AsyncPayload *) {
+  using namespace rstd::serde;
+  return RecordDefinition<AsyncPayload, "AsyncPayload", Direction::Both,
+                          UnknownFieldPolicy::Reject,
+                          Member<&AsyncPayload::value, "value">,
+                          Member<&AsyncPayload::labels, "labels">>{};
+}
+
+void async_results(Checks &checks) {
+  auto state = luato::State::create(luato::StateOptions::base()).unwrap();
+  auto foreign_state =
+      luato::State::create(luato::StateOptions::base()).unwrap();
+  checks.ok(foreign_state.register_userdata(counter_spec()),
+            "register foreign counter");
+  auto foreign = foreign_state.create_userdata(Counter{i64(1)}).unwrap();
+  auto spec = counter_spec();
+  int failures = 0;
+  int argument_failures = 0, execution_failures = 0, return_failures = 0;
+  int result_drops = 0;
+  auto failed = [&](const luato::UserDataHandle &, const luato::Error &,
+                    luato::AsyncMethodErrorKind kind) {
+    ++failures;
+    switch (kind) {
+    case luato::AsyncMethodErrorKind::Arguments:
+      ++argument_failures;
+      break;
+    case luato::AsyncMethodErrorKind::Execution:
+      ++execution_failures;
+      break;
+    case luato::AsyncMethodErrorKind::Return:
+      ++return_failures;
+      break;
+    }
+  };
+  spec.async_method(
+      "sum"_Str,
+      [](luato::UserDataHandle self, i64 amount,
+         Option<i64> extra) -> rstd::async::coro<luato::Result<i64>> {
+        co_await rstd::async::yield_now();
+        co_return self.with_mut<Counter>(
+            [&](Counter &counter) -> luato::Result<i64> {
+              counter.value += amount + extra.unwrap_or(i64());
+              return Ok(counter.value);
+            });
+      },
+      failed);
+  spec.async_method(
+      "count"_Str,
+      [](luato::UserDataHandle, luato::Variadic<luato::LuaValue> values)
+          -> rstd::async::coro<luato::Result<i64>> {
+        co_await rstd::async::yield_now();
+        co_return Ok(i64(values.values.len().to_primitive()));
+      });
+  spec.async_method(
+      "payload"_Str,
+      [](luato::UserDataHandle,
+         i64 number) -> rstd::async::coro<luato::Result<luato::AsyncReturn>> {
+        co_await rstd::async::yield_now();
+        AsyncPayload payload{number, {}};
+        payload.labels.push("first"_Str);
+        co_return Ok(luato::AsyncReturn::make([payload = rstd::move(payload)](
+                                                  luato::CallFrame &frame) {
+          return luato::return_value(frame, luato::to_value(frame, payload));
+        }));
+      },
+      failed);
+  spec.async_method(
+      "bad"_Str,
+      [](luato::UserDataHandle)
+          -> rstd::async::coro<luato::Result<luato::AsyncReturn>> {
+        co_await rstd::async::yield_now();
+        co_return Ok(luato::AsyncReturn::make(
+            [](luato::CallFrame &) -> luato::BindingResult {
+              return Err(luato::Error::make(luato::ErrorKind::Type,
+                                            "encoder"_Str,
+                                            "cannot encode result"_Str));
+            }));
+      },
+      failed);
+  spec.async_method(
+      "foreign"_Str,
+      [foreign = rstd::move(foreign)](luato::UserDataHandle) mutable
+          -> rstd::async::coro<luato::Result<luato::UserDataHandle>> {
+        co_await rstd::async::yield_now();
+        co_return foreign.clone();
+      },
+      failed);
+  spec.async_method(
+      "task_error"_Str,
+      [](luato::UserDataHandle) -> rstd::async::coro<luato::Result<i64>> {
+        co_await rstd::async::yield_now();
+        co_return Err(luato::Error::make(luato::ErrorKind::Runtime,
+                                         "worker"_Str, "worker rejected"_Str));
+      },
+      failed);
+  spec.async_method(
+      "limited"_Str,
+      [&state, &result_drops](luato::UserDataHandle)
+          -> rstd::async::coro<luato::Result<luato::AsyncReturn>> {
+        co_await rstd::async::yield_now();
+        auto text = String::make();
+        for (usize index{}; index < usize(131072); ++index)
+          text.push_ascii('x');
+        auto used = state.used_memory().unwrap();
+        state.set_memory_limit(used + usize(4096)).unwrap();
+        co_return Ok(luato::AsyncReturn::make(
+            [text = rstd::move(text),
+             tracked = Tracked(result_drops)](luato::CallFrame &frame) mutable {
+              return luato::return_value(frame, rstd::move(text));
+            }));
+      },
+      failed);
+  checks.ok(state.register_userdata(rstd::move(spec)),
+            "register typed async results");
+  auto handle = state.create_userdata(Counter{i64(10)}).unwrap();
+  auto run = function(state, R"(
+return function(value)
+  assert(value:sum(2) == 12)
+  assert(value:sum(1,3) == 16)
+  assert(value:count(1,'two',{}) == 3)
+  local first = value:payload(7)
+  local second = value:payload(9)
+  assert(first.value == 7 and second.value == 9 and first ~= second)
+  assert(first.labels[1] == 'first')
+  assert(not pcall(function() value:sum('bad') end))
+  assert(not pcall(function() value:sum() end))
+  local ok, err = pcall(function() value:bad() end)
+  assert(not ok)
+  return first
+end
+)"_str);
+  auto runtime = rstd::async::RuntimeBuilder::current_thread()
+                     .enable_all()
+                     .build()
+                     .unwrap();
+  auto result = runtime.block_on(
+      run.call_async_typed<luato::TableHandle>(handle.clone().unwrap()));
+  if (checks.ok(result, "typed userdata results encode inside continuation")) {
+    auto payload = luato::from_value<AsyncPayload>(
+        luato::LuaValue::Table(rstd::move(*result)));
+    checks.expect(payload.is_ok() && payload->value == i64(7),
+                  "decode resumed structured result");
+  }
+  checks.expect(failures == 3,
+                "observe argument and protected result errors once");
+  auto bad =
+      function(state, "return function(value) return value:bad() end"_str);
+  auto rejected = runtime.block_on(
+      bad.call_async_typed<luato::LuaValue>(handle.clone().unwrap()));
+  checks.error(rejected, luato::ErrorKind::Type,
+               "preserve continuation encoding error kind");
+  checks.expect(failures == 4 && rejected.is_err() &&
+                    rejected.as_ref().unwrap_err().message.as_str().contains(
+                        "cannot encode result"_str),
+                "preserve encoding cause and notify once");
+  auto foreign_call =
+      function(state, "return function(value) return value:foreign() end"_str);
+  auto wrong_vm = runtime.block_on(
+      foreign_call.call_async_typed<luato::LuaValue>(handle.clone().unwrap()));
+  checks.error(wrong_vm, luato::ErrorKind::Binding,
+               "typed async return rejects foreign userdata");
+  checks.expect(failures == 5, "foreign async return notifies once");
+  auto limited =
+      function(state, "return function(value) return value:limited() end"_str);
+  auto exhausted = runtime.block_on(
+      limited.call_async_typed<luato::LuaValue>(handle.clone().unwrap()));
+  checks.ok(state.set_memory_limit(usize()),
+            "clear async result allocation limit");
+  checks.error(exhausted, luato::ErrorKind::Memory,
+               "async result allocation failure stays protected");
+  checks.expect(failures == 6 && result_drops == 1,
+                "allocation failure notifies and drops owned result once");
+  auto task_error = function(
+      state, "return function(value) return value:task_error() end"_str);
+  auto execution = runtime.block_on(
+      task_error.call_async_typed<luato::LuaValue>(rstd::move(handle)));
+  checks.error(execution, luato::ErrorKind::Runtime,
+               "async execution error reaches caller");
+  checks.expect(
+      failures == 7 && argument_failures == 2 && execution_failures == 1 &&
+          return_failures == 4,
+      "async observer distinguishes argument execution and return failures");
+  auto table = state.create_table().unwrap();
+  auto long_key = String::make();
+  for (usize index{}; index < usize(131072); ++index)
+    long_key.push_ascii('k');
+  state.set_memory_limit(state.used_memory().unwrap() + usize(4096)).unwrap();
+  auto lookup = table.get_in_call(
+      luato::LuaValue::Bytes(rstd::move(long_key).into_bytes()));
+  checks.ok(state.set_memory_limit(usize()),
+            "clear suspended table lookup limit");
+  checks.error(
+      lookup, luato::ErrorKind::Memory,
+      "owned table lookup outside a callback protects allocation failures");
+  checks.ok(state.execute_entry(source("assert(6*7==42)"_str)),
+            "state recovers after typed async encoding errors");
+}
+
 } // namespace
 
 auto expect_userdata_contract() -> int {
@@ -741,6 +935,7 @@ auto expect_userdata_contract() -> int {
   cross_vm(checks);
   frame_creation_and_errors(checks);
   async_typed_and_cancel(checks);
+  async_results(checks);
   __builtin_printf("userdata: %d assertions, %d failures\n", checks.assertions,
                    checks.failures);
   return checks.failures;

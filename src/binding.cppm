@@ -456,12 +456,62 @@ private:
 inline constexpr auto variadic_arity = usize(18446744073709551615ULL);
 
 using NativeCallback = dyn<FnMut<BindingResult(CallFrame &)>>;
+class AsyncReturn {
+  Option<Box<NativeCallback>> callback_;
+  Option<Box<dyn<FnMut<void(const Error &)>>>> failure_;
+
+  explicit AsyncReturn(Box<NativeCallback> callback)
+      : callback_(Some(rstd::move(callback))) {}
+  auto take_callback() -> Box<NativeCallback> {
+    return rstd::move(callback_.take()).unwrap();
+  }
+  void failed(const Error &error) {
+    if (failure_.is_some())
+      (**failure_)(error);
+  }
+  friend class State;
+
+public:
+  AsyncReturn(AsyncReturn &&) noexcept = default;
+  auto operator=(AsyncReturn &&) noexcept -> AsyncReturn & = default;
+  template <typename F> static auto make(F &&finish) -> AsyncReturn {
+    return AsyncReturn(Box<NativeCallback>::make(rstd::forward<F>(finish)));
+  }
+  static auto values(MultiValue values) -> AsyncReturn;
+  template <typename F> auto on_error(F &&failure) && -> AsyncReturn {
+    failure_ = Some(Box<dyn<FnMut<void(const Error &)>>>::make(
+        [previous = failure_.take(),
+         failure = rstd::forward<F>(failure)](const Error &error) mutable {
+          if (previous.is_some())
+            (**previous)(error);
+          failure(error);
+        }));
+    return rstd::move(*this);
+  }
+};
+
+template <typename T>
+auto async_return(rstd::async::coro<Result<T>> task)
+    -> rstd::async::coro<Result<AsyncReturn>> {
+  auto result = co_await rstd::move(task);
+  if (result.is_err())
+    co_return Err(rstd::move(result).unwrap_err());
+  if constexpr (rstd::mtp::same_as<T, AsyncReturn>)
+    co_return Ok(rstd::move(*result));
+  else {
+    static_assert(rstd::mtp::same_as<T, MultiValue>);
+    co_return Ok(AsyncReturn::values(rstd::move(*result)));
+  }
+}
+
 using AsyncNativeStarter =
     dyn<FnMut<Result<rstd::async::coro<Result<Array>>>(CallFrame &)>>;
 using AsyncHandleStarter =
     dyn<FnMut<Result<rstd::async::coro<Result<OpaqueHandle>>>(CallFrame &)>>;
 using AsyncValuesStarter =
     dyn<FnMut<Result<rstd::async::coro<Result<MultiValue>>>(CallFrame &)>>;
+using AsyncReturnStarter =
+    dyn<FnMut<Result<rstd::async::coro<Result<AsyncReturn>>>(CallFrame &)>>;
 
 } // namespace luato
 
@@ -787,18 +837,26 @@ public:
   template <typename Callable>
   static auto make(String name, usize arity, Callable &&callable)
       -> AsyncNativeValuesFunctionSpec {
+    auto starter =
+        [callable = rstd::forward<Callable>(callable)](CallFrame &frame) mutable
+        -> Result<rstd::async::coro<Result<AsyncReturn>>> {
+      auto started = callable(frame);
+      if (started.is_err())
+        return Err(rstd::move(started).unwrap_err());
+      return Ok(async_return(rstd::move(*started)));
+    };
     return AsyncNativeValuesFunctionSpec(
         rstd::move(name), arity,
-        Box<AsyncValuesStarter>::make(rstd::forward<Callable>(callable)));
+        Box<AsyncReturnStarter>::make(rstd::move(starter)));
   }
 
 private:
   AsyncNativeValuesFunctionSpec(String name, usize arity,
-                                Box<AsyncValuesStarter> starter);
+                                Box<AsyncReturnStarter> starter);
 
   String name_;
   usize arity_;
-  Box<AsyncValuesStarter> starter_;
+  Box<AsyncReturnStarter> starter_;
 
   friend class State;
 };
