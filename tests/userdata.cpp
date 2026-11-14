@@ -606,6 +606,188 @@ void cross_vm(Checks &checks) {
       "foreign callback error leaves destination VM usable");
 }
 
+void return_policies(Checks &checks) {
+  auto state =
+      luato::State::create(luato::StateOptions::build_script().with_coroutine())
+          .unwrap();
+  auto runtime = rstd::async::RuntimeBuilder::current_thread()
+                     .enable_all()
+                     .build()
+                     .unwrap();
+  auto nothing = function(state, "return function() end"_str);
+  auto nil = function(state, "return function() return nil end"_str);
+  auto multiple =
+      function(state, "return function() return 1, nil, {} end"_str);
+  auto opaque = function(
+      state,
+      "return function() return coroutine.create(function() end) end"_str);
+  auto failure =
+      function(state, "return function() error('return failure') end"_str);
+  auto options = [] {
+    return luato::ReturnOptions{Some(luato::Error::make(
+        luato::ErrorKind::Module, "return-test"_Str, "invalid result"_Str))};
+  };
+  auto module = luato::ModuleSpec("return_host"_Str);
+  module.function("fail"_Str, []() -> luato::Result<empty> {
+    auto error = luato::Error::structured(luato::ErrorKind::Runtime,
+                                          "native"_Str, "execution failed"_Str,
+                                          "returns"_Str, "failure"_Str)
+                     .with_cause(luato::Error::binding("native cause"_Str));
+    error.traceback = "native traceback"_Str;
+    return Err(rstd::move(error));
+  });
+  module.async_function("wait"_Str,
+                        []() -> rstd::async::coro<luato::Result<i64>> {
+                          co_await rstd::async::yield_now();
+                          co_return Ok(i64(42));
+                        });
+  checks.ok(state.register_module(rstd::move(module)),
+            "register return policy callbacks");
+
+  checks.ok(nothing.call<empty>(), "empty accepts exactly zero returns");
+  checks.error(nil.call<empty>(), luato::ErrorKind::Type,
+               "empty rejects a single nil");
+  checks.error(multiple.call<empty>(), luato::ErrorKind::Type,
+               "empty rejects multiple returns");
+  auto value = nil.call<luato::LuaValue>();
+  checks.expect(value.is_ok() && value->is_Nil(),
+                "single LuaValue preserves nil");
+  checks.error(nothing.call<luato::LuaValue>(), luato::ErrorKind::Type,
+               "single LuaValue rejects missing returns");
+  checks.error(multiple.call<luato::LuaValue>(), luato::ErrorKind::Type,
+               "single LuaValue rejects extra returns");
+  checks.error(multiple.call<luato::LuaValue>(options()),
+               luato::ErrorKind::Module,
+               "count error uses the supplied policy");
+  auto mismatch = nil.call<luato::UserDataHandle>(options());
+  checks.error(mismatch, luato::ErrorKind::Module,
+               "type error uses the supplied policy");
+  if (mismatch.is_err())
+    checks.expect(mismatch.as_ref().unwrap_err().source == "return-test"_str &&
+                      mismatch.as_ref().unwrap_err().message ==
+                          "invalid result"_str,
+                  "conversion policy preserves source and message");
+  checks.error(failure.call<luato::LuaValue>(options()),
+               luato::ErrorKind::Runtime,
+               "policy does not replace execution errors");
+  auto native_failure =
+      function(state, "return function() return return_host.fail() end"_str);
+  auto check_cause = [&](const auto &result) {
+    checks.error(result, luato::ErrorKind::Runtime,
+                 "execution error retains its kind");
+    if (result.is_err()) {
+      const auto &error = result.as_ref().unwrap_err();
+      checks.expect(
+          error.source == "native"_str &&
+              error.message == "execution failed"_str &&
+              error.details.is_some() &&
+              error.details->domain == "returns"_str &&
+              error.traceback == "native traceback"_str,
+          "conversion policy preserves execution error details and traceback");
+      auto cause = error.native_cause();
+      checks.expect(cause.is_some(),
+                    "conversion policy preserves execution error cause");
+      if (cause.is_some()) {
+        auto original = rstd::error::downcast_ref<luato::Error>(*cause);
+        checks.expect(
+            original.is_some() && (*original)->message == "native cause"_str,
+            "execution error cause keeps its native type and message");
+      }
+    }
+  };
+  check_cause(native_failure.call<luato::LuaValue>(options()));
+  check_cause(native_failure.call<luato::IgnoreReturns>(options()));
+  check_cause(runtime.block_on(rstd::async::into_future(
+      native_failure.call_async_typed<luato::IgnoreReturns>(options()))));
+
+  for (auto *target : {&nothing, &nil, &multiple, &opaque}) {
+    checks.ok(target->call<luato::IgnoreReturns>(),
+              "sync ignore accepts arbitrary return values");
+    checks.ok(runtime.block_on(rstd::async::into_future(
+                  target->call_async_typed<luato::IgnoreReturns>())),
+              "async ignore accepts arbitrary return values");
+  }
+  checks.error(runtime.block_on(rstd::async::into_future(
+                   failure.call_async_typed<luato::IgnoreReturns>(options()))),
+               luato::ErrorKind::Runtime,
+               "async ignore propagates execution errors");
+  checks.ok(runtime.block_on(
+                rstd::async::into_future(nothing.call_async_typed<empty>())),
+            "async empty accepts zero returns");
+  checks.error(
+      runtime.block_on(rstd::async::into_future(nil.call_async_typed<empty>())),
+      luato::ErrorKind::Type, "async empty rejects nil");
+  checks.error(runtime.block_on(rstd::async::into_future(
+                   multiple.call_async_typed<luato::LuaValue>(options()))),
+               luato::ErrorKind::Module,
+               "async single return preserves count policy");
+  checks.error(runtime.block_on(rstd::async::into_future(
+                   nothing.call_async_typed<luato::LuaValue>())),
+               luato::ErrorKind::Type,
+               "async single return rejects missing returns");
+  auto async_nil = runtime.block_on(
+      rstd::async::into_future(nil.call_async_typed<luato::LuaValue>()));
+  checks.expect(async_nil.is_ok() && async_nil->is_Nil(),
+                "async single LuaValue preserves nil");
+
+  auto objects = function(state, R"LUA(
+    return_refs = setmetatable({}, {__mode='v'})
+    return function()
+      local value = setmetatable({}, {__index=function() error('unexpected snapshot') end})
+      value.self = value
+      local callback = function() return value end
+      local thread = coroutine.create(callback)
+      return_refs[1], return_refs[2], return_refs[3] = value, callback, thread
+      return callback, thread, value
+    end
+  )LUA"_str);
+  for (int repeat = 0; repeat < 3; ++repeat) {
+    checks.ok(
+        objects.call<luato::IgnoreReturns>(),
+        "sync ignore never snapshots functions, threads or cyclic tables");
+    checks.ok(
+        state.execute_entry(source(
+            "collectgarbage('collect'); assert(next(return_refs) == nil)"_str)),
+        "sync ignore releases returned objects and restores the stack");
+    checks.ok(
+        runtime.block_on(rstd::async::into_future(
+            objects.call_async_typed<luato::IgnoreReturns>())),
+        "async ignore never snapshots functions, threads or cyclic tables");
+    checks.ok(
+        state.execute_entry(source(
+            "collectgarbage('collect'); assert(next(return_refs) == nil)"_str)),
+        "async ignore releases its thread registry reference and returned "
+        "objects");
+  }
+
+  auto owned = [&] {
+    auto temporary =
+        function(state, "return function() return return_host.wait() end"_str);
+    return temporary.call_async_typed<luato::LuaValue>(options());
+  }();
+  auto result = runtime.block_on(rstd::async::into_future(rstd::move(owned)));
+  checks.expect(result.is_ok() && result->is_Integer() &&
+                    result->as_Integer().value == i64(42),
+                "unpolled typed call owns its function and conversion policy");
+  auto owned_userdata = [&] {
+    state.register_userdata(counter_spec()).unwrap();
+    auto temporary = function(state, R"LUA(
+      return function(value) return_host.wait(); return value end
+    )LUA"_str);
+    auto handle = state.create_userdata(Counter{i64(17)}).unwrap();
+    return temporary.call_async_typed<luato::UserDataHandle>(
+        options(), rstd::move(handle));
+  }();
+  auto userdata =
+      runtime.block_on(rstd::async::into_future(rstd::move(owned_userdata)));
+  if (checks.ok(userdata, "unpolled typed call owns its userdata argument"))
+    checks.expect(userdata->with<Counter>(read_counter).unwrap() == i64(17),
+                  "userdata stays valid after the original function and handle "
+                  "are destroyed");
+  checks.ok(state.execute_entry(source("assert(6*7==42)"_str)),
+            "return policies leave the VM usable");
+}
+
 void frame_creation_and_errors(Checks &checks) {
   int drops{};
   int unregistered_drops{};
@@ -1016,6 +1198,7 @@ auto expect_userdata_contract() -> int {
   destruction_and_gc(checks);
   destroyed_vm(checks);
   typed_calls(checks);
+  return_policies(checks);
   cross_vm(checks);
   frame_creation_and_errors(checks);
   async_typed_and_cancel(checks);

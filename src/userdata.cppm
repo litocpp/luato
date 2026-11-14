@@ -132,44 +132,65 @@ auto return_value(CallFrame &frame, Result<T> value) -> BindingResult {
   return return_value(frame, rstd::move(*value));
 }
 
-template <typename R> auto from_multi(MultiValue values) -> Result<R> {
+template <typename R>
+auto from_multi(MultiValue values, ReturnOptions options = {}) -> Result<R> {
   if constexpr (rstd::mtp::same_as<R, MultiValue>)
     return Ok(rstd::move(values));
+  else if constexpr (rstd::mtp::same_as<R, IgnoreReturns>)
+    return Ok(IgnoreReturns{});
   else if constexpr (rstd::mtp::same_as<R, empty>) {
     if (values.is_empty())
       return Ok(empty{});
   } else if (values.len() == usize(1)) {
     auto entries = rstd::move(values).into_values();
-    return FromLua<R>::from_lua(rstd::move(entries[usize()]));
+    auto result = FromLua<R>::from_lua(rstd::move(entries[usize()]));
+    if (result.is_err() && options.conversion_error.is_some())
+      return Err(rstd::move(*options.conversion_error));
+    return result;
   }
+  if (options.conversion_error.is_some())
+    return Err(rstd::move(*options.conversion_error));
   return Err(Error::make(ErrorKind::Type, String::make(),
                          "unexpected Lua return value count"_Str));
 }
 
 template <typename R, typename... Args>
 auto FunctionHandle::call(Args... args) -> Result<R> {
+  return call<R>(ReturnOptions{}, rstd::move(args)...);
+}
+
+template <typename R, typename... Args>
+auto FunctionHandle::call(ReturnOptions options, Args... args) -> Result<R> {
   auto values = MultiValue::make();
   (values.push(IntoLua<Args>::into_lua(rstd::move(args))), ...);
-  auto result = call_values(rstd::move(values));
+  auto result = call_values_impl(rstd::move(values),
+                                 rstd::mtp::same_as<R, IgnoreReturns>);
   if (result.is_err())
     return Err(rstd::move(result).unwrap_err());
-  return from_multi<R>(rstd::move(*result));
+  return from_multi<R>(rstd::move(*result), rstd::move(options));
 }
 
 template <typename R, typename... Args>
 auto FunctionHandle::call_async_typed(Args... args)
     -> rstd::async::coro<Result<R>> {
+  return call_async_typed<R>(ReturnOptions{}, rstd::move(args)...);
+}
+
+template <typename R, typename... Args>
+auto FunctionHandle::call_async_typed(ReturnOptions options, Args... args)
+    -> rstd::async::coro<Result<R>> {
   auto values = MultiValue::make();
   (values.push(IntoLua<Args>::into_lua(rstd::move(args))), ...);
-  auto task = call_async(rstd::move(values));
-  // call_async owns a cloned function before suspension.
-  return [](rstd::async::coro<Result<MultiValue>> task)
-             -> rstd::async::coro<Result<R>> {
+  auto task = call_async_owned(rstd::move(values),
+                               rstd::mtp::same_as<R, IgnoreReturns>);
+  // The task owns a cloned function before suspension.
+  return [](rstd::async::coro<Result<MultiValue>> task,
+            ReturnOptions options) -> rstd::async::coro<Result<R>> {
     auto result = co_await rstd::move(task);
     if (result.is_err())
       co_return Err(rstd::move(result).unwrap_err());
-    co_return from_multi<R>(rstd::move(*result));
-  }(rstd::move(task));
+    co_return from_multi<R>(rstd::move(*result), rstd::move(options));
+  }(rstd::move(task), rstd::move(options));
 }
 
 } // namespace luato

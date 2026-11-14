@@ -20,6 +20,7 @@ enum class StandardLibrary {
   Table,
   Math,
   Utf8,
+  Coroutine,
 };
 
 struct StateOptions {
@@ -45,6 +46,12 @@ struct StateOptions {
     return result;
   }
   constexpr auto text_only() const noexcept -> bool { return text_only_; }
+  constexpr auto with_coroutine(bool enabled = true) const noexcept
+      -> StateOptions {
+    auto result = *this;
+    result.open_coroutine_ = enabled;
+    return result;
+  }
   static constexpr auto none() noexcept -> StateOptions {
     return StateOptions(false, false, false, false, false);
   }
@@ -67,6 +74,8 @@ struct StateOptions {
       return open_math_;
     case StandardLibrary::Utf8:
       return open_utf8_;
+    case StandardLibrary::Coroutine:
+      return open_coroutine_;
     }
     return false;
   }
@@ -86,6 +95,7 @@ private:
   bool open_table_;
   bool open_math_;
   bool open_utf8_;
+  bool open_coroutine_{};
   bool restricted_;
   bool text_only_;
   u64 instructions_;
@@ -100,6 +110,14 @@ class MultiValue;
 class LuaValue;
 struct LuaValueAccess;
 template <typename T> class UserDataSpec;
+
+// Unlike empty, this accepts and discards any number of Lua return values.
+struct IgnoreReturns {};
+
+struct ReturnOptions {
+  // Overrides return conversion failures, never Lua execution failures.
+  Option<Error> conversion_error;
+};
 
 class UserDataHandle {
 public:
@@ -190,11 +208,20 @@ public:
       -> rstd::async::coro<Result<MultiValue>>;
   template <typename R, typename... Args> auto call(Args... args) -> Result<R>;
   template <typename R, typename... Args>
+  auto call(ReturnOptions options, Args... args) -> Result<R>;
+  template <typename R, typename... Args>
   auto call_async_typed(Args... args) -> rstd::async::coro<Result<R>>;
+  template <typename R, typename... Args>
+  auto call_async_typed(ReturnOptions options, Args... args)
+      -> rstd::async::coro<Result<R>>;
 
 private:
+  auto call_values_impl(MultiValue arguments, bool ignore_returns)
+      -> Result<MultiValue>;
+  auto call_async_owned(MultiValue arguments, bool ignore_returns)
+      -> rstd::async::coro<Result<MultiValue>>;
   static auto call_async_impl(FunctionHandle handle, MultiValue arguments,
-                              bool nested)
+                              bool nested, bool ignore_returns)
       -> rstd::async::coro<Result<MultiValue>>;
   explicit FunctionHandle(void *handle) noexcept : handle_(handle) {}
   void reset() noexcept;
@@ -2033,6 +2060,8 @@ auto State::create(StateOptions options) -> Result<State> {
     libraries |= LUA_MATHLIBK;
   if (options.contains(StandardLibrary::Utf8))
     libraries |= LUA_UTF8LIBK;
+  if (options.contains(StandardLibrary::Coroutine))
+    libraries |= LUA_COLIBK;
   lua_pushinteger(lua, static_cast<lua_Integer>(libraries));
   auto status = lua_pcall(lua, 1, 0, 0);
   if (status != LUA_OK) {
@@ -4497,11 +4526,16 @@ auto failed_async_call(Error error) -> rstd::async::coro<Result<MultiValue>> {
 
 auto FunctionHandle::call_async(MultiValue arguments)
     -> rstd::async::coro<Result<MultiValue>> {
+  return call_async_owned(rstd::move(arguments), false);
+}
+
+auto FunctionHandle::call_async_owned(MultiValue arguments, bool ignore_returns)
+    -> rstd::async::coro<Result<MultiValue>> {
   auto owned = clone();
   if (owned.is_err())
     return failed_async_call(rstd::move(owned).unwrap_err());
   return call_async_impl(rstd::move(owned).unwrap(), rstd::move(arguments),
-                         false);
+                         false, ignore_returns);
 }
 
 auto FunctionHandle::call_async_nested(MultiValue arguments)
@@ -4510,11 +4544,12 @@ auto FunctionHandle::call_async_nested(MultiValue arguments)
   if (owned.is_err())
     return failed_async_call(rstd::move(owned).unwrap_err());
   return call_async_impl(rstd::move(owned).unwrap(), rstd::move(arguments),
-                         true);
+                         true, false);
 }
 
 auto FunctionHandle::call_async_impl(FunctionHandle function,
-                                     MultiValue arguments, bool nested)
+                                     MultiValue arguments, bool nested,
+                                     bool ignore_returns)
     -> rstd::async::coro<Result<MultiValue>> {
   if (!function.handle_)
     co_return Err(Error::binding("Lua function handle was moved"_Str));
@@ -4609,6 +4644,8 @@ auto FunctionHandle::call_async_impl(FunctionHandle function,
     co_return Err(rstd::move(error));
   }
   auto output = MultiValue::make();
+  if (ignore_returns)
+    co_return Ok(rstd::move(output));
   auto total = lua_gettop(thread);
   auto base = 1;
   for (int index = 0; index < total; ++index) {
@@ -4648,6 +4685,11 @@ int invoke_dynamic_function(lua_State *lua) {
 }
 
 auto FunctionHandle::call_values(MultiValue arguments) -> Result<MultiValue> {
+  return call_values_impl(rstd::move(arguments), false);
+}
+
+auto FunctionHandle::call_values_impl(MultiValue arguments, bool ignore_returns)
+    -> Result<MultiValue> {
   if (!handle_)
     return Err(Error::binding("Lua function handle was moved"_Str));
   if (arguments.len() > usize(64))
@@ -4687,7 +4729,7 @@ auto FunctionHandle::call_values(MultiValue arguments) -> Result<MultiValue> {
   }
   auto result = MultiValue::make();
   auto end = lua_gettop(lua);
-  for (int index = top + 1; index <= end; ++index) {
+  for (int index = top + 1; !ignore_returns && index <= end; ++index) {
     auto value = read_lua_value(lua, index, owner);
     if (value.is_err()) {
       auto error = rstd::move(value).unwrap_err();
