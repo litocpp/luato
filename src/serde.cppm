@@ -360,8 +360,7 @@ public:
           return host(value.same_object_in_call(*options_.null_value));
         return Ok(false);
       }
-    default:
-      return Ok(false);
+      RSTD_CASE_DEFAULT { return Ok(false); }
     }
   }
   auto has_metatable(const TableHandle *marker) const
@@ -399,8 +398,7 @@ public:
     RSTD_MATCH(value_) {
       RSTD_CASE(Number, value) { return Ok(value); }
       RSTD_CASE(Integer, value) { return Ok(rstd::as_cast<f64>(value)); }
-    default:
-      return Err(invalid_value("expected a number"_str));
+      RSTD_CASE_DEFAULT { return Err(invalid_value("expected a number"_str)); }
     }
   }
   auto deserialize_string() -> rstd::Result<String, SerdeError> {
@@ -773,8 +771,9 @@ inline auto ValueDeserializer::deserialize_json_value()
       rstd_try(input.end());
       return Ok(rstd::json::Value::Object(rstd::move(values)));
     }
-  default:
-    return Err(invalid_value("unsupported Lua value in JSON"_str));
+    RSTD_CASE_DEFAULT {
+      return Err(invalid_value("unsupported Lua value in JSON"_str));
+    }
   }
 }
 
@@ -1220,8 +1219,7 @@ inline auto SnapshotDeserializer::deserialize_json_value()
         return Ok(rstd::json::Value::Array(
             rstd_try(rstd::serde::deserialize<Vec<rstd::json::Value>>(*this))));
       }
-    default:
-      break;
+      RSTD_CASE_DEFAULT { break; }
     }
   }
   return Err(invalid_value("unsupported Lua value in JSON"_str));
