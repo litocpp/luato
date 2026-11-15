@@ -10,7 +10,7 @@ archive = "luato"
 
 [[test]]
 name = "luato-contract"
-sources = ["tests/main.cpp", "tests/i18n.cpp", "tests/typed.cpp", "tests/async.cpp", "tests/userdata.cpp", "tests/serde.cpp"]
+sources = ["tests/main.cpp", "tests/i18n.cpp", "tests/typed.cpp", "tests/async.cpp", "tests/userdata.cpp", "tests/serde.cpp", "tests/serde_capture.cpp"]
 
 [usage]
 private-definitions = [
