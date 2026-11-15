@@ -22,7 +22,7 @@ target_link_libraries(
          rstd::json
          rstd::serde
          luato::ffi::lua)
-target_sources(luato.lib PRIVATE i18n/mod.cpp)
+target_sources(luato.lib PRIVATE serde.cpp i18n/mod.cpp)
 target_sources(
   luato.lib
   PUBLIC FILE_SET

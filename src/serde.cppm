@@ -19,6 +19,8 @@ struct LuaValueCaptureStorage {
   Option<TableHandle> object_metatable;
   Option<TableHandle> array_metatable;
 };
+auto make_serde_host_error(DataPath path, ref<str> message, Error source)
+    -> SerdeError;
 } // namespace luato
 
 export namespace luato {
@@ -92,9 +94,9 @@ public:
   template <class T>
   auto host(Result<T> value) const -> rstd::Result<T, SerdeError> {
     if (value.is_err())
-      return Err(SerdeError::invalid_value_with_source(
-          path_.clone(), "cannot write Lua value"_str,
-          rstd::move(value).unwrap_err()));
+      return Err(make_serde_host_error(path_.clone(),
+                                       "cannot write Lua value"_str,
+                                       rstd::move(value).unwrap_err()));
     return Ok(rstd::move(value).unwrap());
   }
   auto child(DataPath path) const -> ValueSerializer {
@@ -383,9 +385,9 @@ public:
   template <class T>
   auto host(Result<T> value) const -> rstd::Result<T, SerdeError> {
     if (value.is_err())
-      return Err(SerdeError::invalid_value_with_source(
-          path_.clone(), "cannot read Lua value"_str,
-          rstd::move(value).unwrap_err()));
+      return Err(make_serde_host_error(path_.clone(),
+                                       "cannot read Lua value"_str,
+                                       rstd::move(value).unwrap_err()));
     return Ok(rstd::move(value).unwrap());
   }
   auto is_none() const -> rstd::Result<bool, SerdeError> {
