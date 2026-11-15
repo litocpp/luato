@@ -1,3 +1,4 @@
 /build
+/CMakeUserPresets.json
 /.lito
 /lito.lock
