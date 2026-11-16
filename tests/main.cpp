@@ -7,6 +7,7 @@ auto expect_serde_write_contract() -> int;
 auto expect_serde_capture_contract() -> int;
 auto expect_async_contract() -> int;
 auto expect_userdata_contract() -> int;
+auto expect_memory_contract() -> int;
 
 using namespace rstd::prelude;
 using namespace rstd::literals;
@@ -498,6 +499,8 @@ void expect_script_error(Checks &checks, luato::State &state,
 } // namespace
 
 int main(int argc, char **argv) {
+  if (argc == 2 && borrowed_str(argv[1]) == "--memory"_str)
+    return expect_memory_contract();
   if (argc == 2 && borrowed_str(argv[1]) == "--serde"_str)
     return expect_serde_contract();
   if (argc == 2 && borrowed_str(argv[1]) == "--serde-write"_str)
@@ -881,9 +884,9 @@ int main(int argc, char **argv) {
   checks.expect(callback_drops == 2,
                 "state should destroy each callback context exactly once");
   auto userdata_failures = expect_userdata_contract();
-  return checks.failures == 0 && expect_typed_contract() == 0 &&
-                 expect_async_contract() == 0 && userdata_failures == 0 &&
-                 expect_serde_write_contract() == 0 &&
+  return checks.failures == 0 && expect_memory_contract() == 0 &&
+                 expect_typed_contract() == 0 && expect_async_contract() == 0 &&
+                 userdata_failures == 0 && expect_serde_write_contract() == 0 &&
                  expect_serde_capture_contract() == 0
              ? 0
              : 1;

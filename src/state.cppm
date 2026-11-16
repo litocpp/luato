@@ -5,6 +5,7 @@ export module luato:state;
 
 export import :binding;
 export import :module_loader;
+export import :memory;
 
 import :ffi.lua;
 import rstd;
@@ -334,7 +335,8 @@ public:
   auto operator=(State &&other) noexcept -> State &;
   ~State();
 
-  static auto create(StateOptions options) -> Result<State>;
+  static auto create(StateOptions options, MemoryOptions memory = {})
+      -> Result<State>;
 
   auto register_module(ModuleSpec module) -> Result<empty>;
   auto register_native_require_module(NativeRequireModuleSpec module)
@@ -368,6 +370,11 @@ public:
   auto used_memory() const -> Result<usize>;
   // Zero disables the limit; returns the previous limit.
   auto set_memory_limit(usize limit) -> Result<usize>;
+  auto memory_statistics() const -> Result<MemoryStatistics>;
+  auto memory_observer() const -> Result<MemoryObserver>;
+  auto trim_memory(usize retain = {}) const
+      -> Result<rstd::alloc::PoolTrimReport>;
+  auto collect_garbage() -> Result<empty>;
   auto loaded_modules() const noexcept -> slice<LoadedModule>;
 
 private:
@@ -523,6 +530,7 @@ struct NativeRequireModule {
 };
 
 struct StateStorage {
+  Option<VmMemory> memory;
   lua_State *lua;
   bool executing{};
   Vec<Box<CallbackSlot>> callbacks;
@@ -537,10 +545,9 @@ struct StateStorage {
   bool text_only{};
   Option<::alloc::sync::Weak<StateStorage>> self_weak;
   unsigned hook_interval{};
-  rstd::size_t memory_used{}, memory_limit{};
-
-  explicit StateStorage(lua_State *state)
-      : lua(state), callbacks(Vec<Box<CallbackSlot>>::make()),
+  explicit StateStorage(lua_State *state, Option<VmMemory> allocator = None())
+      : memory(rstd::move(allocator)), lua(state),
+        callbacks(Vec<Box<CallbackSlot>>::make()),
         pending(Vec<AsyncPending *>::make()), modules(Vec<String>::make()),
         native_require_modules(Vec<NativeRequireModule>::make()),
         module_resolver(None()), module_stack(Vec<ModuleFrame>::make()),
@@ -555,6 +562,8 @@ struct StateStorage {
       entry->active = false;
       entry->release();
     }
+    if (memory.is_some())
+      memory->finish();
   }
   auto has_pending(AsyncPending *entry) const -> bool {
     for (auto *candidate : pending.as_slice())
@@ -577,38 +586,7 @@ struct StateStorage {
 auto lua_allocator(void *userdata, void *pointer, rstd::size_t old_size,
                    rstd::size_t new_size) -> void * {
   auto &storage = *static_cast<StateStorage *>(userdata);
-  if (!pointer)
-    old_size = 0;
-  auto alignment = usize(alignof(max_align_t));
-  if (new_size == 0) {
-    if (pointer) {
-      auto layout = rstd::alloc::Layout::from_size_align_unchecked(
-          usize(old_size), alignment);
-      ::alloc::dealloc(pointer, layout);
-      storage.memory_used -= old_size;
-    }
-    return nullptr;
-  }
-  auto base = storage.memory_used - old_size;
-  if (new_size > static_cast<rstd::size_t>(-1) - base ||
-      (new_size > old_size && storage.memory_limit &&
-       (base > storage.memory_limit || new_size > storage.memory_limit - base)))
-    return nullptr;
-  auto layout =
-      rstd::alloc::Layout::from_size_align(usize(new_size), alignment);
-  if (layout.is_none())
-    return nullptr;
-  void *result;
-  if (pointer) {
-    auto old_layout = rstd::alloc::Layout::from_size_align_unchecked(
-        usize(old_size), alignment);
-    result = ::alloc::realloc(pointer, old_layout, usize(new_size));
-  } else {
-    result = ::alloc::alloc(*layout);
-  }
-  if (result)
-    storage.memory_used = base + new_size;
-  return result;
+  return storage.memory->reallocate(pointer, usize(old_size), usize(new_size));
 }
 
 using SharedState = ::alloc::sync::Arc<StateStorage>;
@@ -2012,8 +1990,12 @@ void State::reset() noexcept {
       Box<SharedState>::from_raw(mut_ptr<SharedState>::from_raw_parts(raw));
 }
 
-auto State::create(StateOptions options) -> Result<State> {
-  auto owner = SharedState::make(nullptr);
+auto State::create(StateOptions options, MemoryOptions options_memory)
+    -> Result<State> {
+  auto memory = VmMemory::create(options_memory);
+  if (memory.is_err())
+    return Err(rstd::move(memory).unwrap_err());
+  auto owner = SharedState::make(nullptr, Some(rstd::move(memory).unwrap()));
   auto *storage = owner.as_ptr().as_raw_ptr();
   auto *lua = lua_newstate(lua_allocator, storage, luaL_makeseed(nullptr));
   if (lua == nullptr) {
@@ -2096,7 +2078,7 @@ auto State::create(StateOptions options) -> Result<State> {
 auto State::used_memory() const -> Result<usize> {
   if (!storage_)
     return Err(moved_state_error());
-  return Ok(usize(state_storage(storage_)->memory_used));
+  return Ok(state_storage(storage_)->memory->used_memory());
 }
 
 auto State::set_memory_limit(usize limit) -> Result<usize> {
@@ -2105,9 +2087,58 @@ auto State::set_memory_limit(usize limit) -> Result<usize> {
   auto &storage = *state_storage(storage_);
   if (storage.executing)
     return Err(reentrant_state_error());
-  auto previous = storage.memory_limit;
-  storage.memory_limit = limit.to_primitive();
-  return Ok(usize(previous));
+  return Ok(storage.memory->set_limit(limit));
+}
+
+auto State::memory_statistics() const -> Result<MemoryStatistics> {
+  if (!storage_)
+    return Err(moved_state_error());
+  return Ok(state_storage(storage_)->memory->statistics());
+}
+
+auto State::memory_observer() const -> Result<MemoryObserver> {
+  if (!storage_)
+    return Err(moved_state_error());
+  return Ok(state_storage(storage_)->memory->observer());
+}
+
+auto State::trim_memory(usize retain) const
+    -> Result<rstd::alloc::PoolTrimReport> {
+  if (!storage_)
+    return Err(moved_state_error());
+  return Ok(state_storage(storage_)->memory->observer().trim(retain));
+}
+
+auto State::collect_garbage() -> Result<empty> {
+  if (!storage_)
+    return Err(moved_state_error());
+  auto owner = static_cast<SharedState *>(storage_)->clone();
+  auto &storage = *owner;
+  if (storage.executing)
+    return Err(reentrant_state_error());
+  ExecutionGuard guard(storage);
+  auto *lua = storage.lua;
+  auto top = lua_gettop(lua);
+  if (!lua_checkstack(lua, 1))
+    return Err(
+        Error::make(ErrorKind::Memory, String{},
+                    "Lua garbage collection stack allocation failed"_Str));
+  lua_pushcfunction(
+      lua, +[](lua_State *state) -> int {
+        (void)lua_gc(state, LUA_GCCOLLECT);
+        return 0;
+      });
+  auto status = lua_pcall(lua, 0, 0, 0);
+  Option<Error> failure;
+  if (status != LUA_OK)
+    failure = Some(error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "collect_garbage"_Str));
+  clear_callback_transients(&storage);
+  lua_settop(lua, top);
+  if (failure.is_some())
+    return Err(failure.take().unwrap());
+  return Ok(empty{});
 }
 
 auto State::register_module(ModuleSpec module) -> Result<empty> {

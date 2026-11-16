@@ -33,6 +33,7 @@ target_sources(
          error.cppm
          binding.cppm
          module_loader.cppm
+         memory.cppm
          state.cppm
          userdata.cppm
          serde.cppm
