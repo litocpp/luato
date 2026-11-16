@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 
 project(
   luato
-  VERSION 0.1.2
+  VERSION 0.1.3
   DESCRIPTION "Typed Lua bindings for C++ modules"
   LANGUAGES C CXX)
 
@@ -48,7 +48,7 @@ if(NOT TARGET rstd::rstd)
   FetchContent_Declare(
     rstd
     GIT_REPOSITORY https://github.com/litocpp/rstd.git
-    GIT_TAG dcf3dd93c7b59f72bf36a8bfd047759b36aacf8c)
+    GIT_TAG 886c4b1e5f148796d92b0d3ca460e5a424d10020)
   FetchContent_MakeAvailable(rstd)
 endif()
 
