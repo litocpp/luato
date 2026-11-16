@@ -26,6 +26,11 @@ struct OpaqueHandle {
   const void *identity{};
 };
 
+struct TableCapacity {
+  usize sequence{};
+  usize records{};
+};
+
 class Value {
   RSTD_ENUM(Value, (Nil, ()), (Number, (f64 value;)), (Integer, (i64 value;)),
             (Boolean, (bool value;)),
@@ -357,8 +362,10 @@ public:
     return read_value_(context_, index);
   }
   void return_value(OpaqueHandle value) { return_value_(context_, value); }
-  auto new_table() -> Result<OpaqueHandle> { return new_table_(context_); }
-  auto create_table() -> Result<TableHandle>;
+  auto new_table(TableCapacity capacity = {}) -> Result<OpaqueHandle> {
+    return new_table_(context_, capacity);
+  }
+  auto create_table(TableCapacity capacity = {}) -> Result<TableHandle>;
   auto validate_value(const LuaValue &value) const -> Result<empty>;
   template <typename T> auto create_userdata(T value) -> Result<UserDataHandle>;
 
@@ -414,7 +421,7 @@ private:
   using RaiseValue = void (*)(void *, Value);
   using ReadValue = auto (*)(void *, usize) -> Result<OpaqueHandle>;
   using ReturnValue = void (*)(void *, OpaqueHandle);
-  using NewTable = auto (*)(void *) -> Result<OpaqueHandle>;
+  using NewTable = auto (*)(void *, TableCapacity) -> Result<OpaqueHandle>;
   using RaiseHandle = void (*)(void *, OpaqueHandle);
   using NewUserData = auto (*)(void *, const void *, void *, void (*)(void *))
       -> Result<OpaqueHandle>;

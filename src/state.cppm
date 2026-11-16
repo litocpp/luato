@@ -345,7 +345,7 @@ public:
   auto execute_file(ref<rstd::path::Path> path) -> Result<ExecutionReport>;
   auto module_table(ref<str> module) -> Result<TableHandle>;
   auto globals() -> Result<TableHandle>;
-  auto create_table() -> Result<TableHandle>;
+  auto create_table(TableCapacity capacity = {}) -> Result<TableHandle>;
   auto validate_value(const LuaValue &value) const -> Result<empty>;
   template <typename T>
   auto register_userdata(UserDataSpec<T> spec) -> Result<empty>;
@@ -1871,30 +1871,16 @@ auto read_lua_argument(void *context, usize index) -> Result<OpaqueHandle> {
   return Ok(OpaqueHandle{new LuaValue(rstd::move(*value))});
 }
 
-int new_lua_table_value(lua_State *lua) {
-  lua_newtable(lua);
-  return 1;
-}
+auto make_lua_table(lua_State *lua, SharedState &owner, TableCapacity capacity)
+    -> Result<TableHandle>;
 
-auto new_lua_table(void *context) -> Result<OpaqueHandle> {
+auto new_lua_table(void *context, TableCapacity capacity)
+    -> Result<OpaqueHandle> {
   auto *invocation = static_cast<Invocation *>(context);
-  if (!lua_checkstack(invocation->lua, 2))
-    return Err(Error::binding("Lua table stack allocation failed"_Str));
-  lua_pushcfunction(invocation->lua, new_lua_table_value);
-  auto status = lua_pcall(invocation->lua, 0, 1, 0);
-  if (status != LUA_OK) {
-    auto error = error_from_top(invocation->lua,
-                                status == LUA_ERRMEM ? ErrorKind::Memory
-                                                     : ErrorKind::Runtime,
-                                "table"_Str);
-    lua_pop(invocation->lua, 1);
-    return Err(rstd::move(error));
-  }
-  auto value = read_lua_value(invocation->lua, -1, invocation->owner);
-  lua_pop(invocation->lua, 1);
-  if (value.is_err())
-    return Err(rstd::move(value).unwrap_err());
-  return Ok(OpaqueHandle{new LuaValue(rstd::move(*value))});
+  auto table = make_lua_table(invocation->lua, invocation->owner, capacity);
+  if (table.is_err())
+    return Err(rstd::move(table).unwrap_err());
+  return Ok(OpaqueHandle{new LuaValue(LuaValue::Table(rstd::move(*table)))});
 }
 
 auto new_lua_userdata(void *context, const void *type, void *object,
@@ -3608,12 +3594,50 @@ auto CallFrame::create_userdata(T value) -> Result<UserDataHandle> {
   return Ok(rstd::move(object.as_UserData().value));
 }
 
-auto CallFrame::create_table() -> Result<TableHandle> {
-  auto result = new_table();
-  if (result.is_err())
-    return Err(rstd::move(result).unwrap_err());
-  auto value = take_lua_value(*result);
-  return Ok(rstd::move(value.as_Table().value));
+struct TableCreation {
+  int sequence;
+  int records;
+  int reference{LUA_NOREF};
+};
+
+int create_lua_table(lua_State *lua) {
+  auto &request = *static_cast<TableCreation *>(lua_touserdata(lua, 1));
+  lua_createtable(lua, request.sequence, request.records);
+  request.reference = luaL_ref(lua, LUA_REGISTRYINDEX);
+  return 0;
+}
+
+auto make_lua_table(lua_State *lua, SharedState &owner, TableCapacity capacity)
+    -> Result<TableHandle> {
+  auto sequence = rstd::try_from<int>(capacity.sequence);
+  if (sequence.is_err())
+    return Err(
+        Error::binding("Lua table sequence capacity is out of range"_Str));
+  auto records = rstd::try_from<int>(capacity.records);
+  if (records.is_err())
+    return Err(
+        Error::binding("Lua table records capacity is out of range"_Str));
+  TableCreation request{*sequence, *records};
+  if (!lua_checkstack(lua, 2))
+    return Err(Error::binding("Lua table stack allocation failed"_Str));
+  auto top = lua_gettop(lua);
+  lua_pushcfunction(lua, create_lua_table);
+  lua_pushlightuserdata(lua, &request);
+  auto status = lua_pcall(lua, 1, 0, 0);
+  if (status != LUA_OK) {
+    auto error = error_from_top(
+        lua, status == LUA_ERRMEM ? ErrorKind::Memory : ErrorKind::Runtime,
+        "table"_Str);
+    lua_settop(lua, top);
+    return Err(rstd::move(error));
+  }
+  return Ok(LuaValueAccess::table(
+      make_registry_handle(owner.clone(), request.reference)));
+}
+
+auto CallFrame::create_table(TableCapacity capacity) -> Result<TableHandle> {
+  auto &invocation = *static_cast<Invocation *>(context_);
+  return make_lua_table(invocation.lua, invocation.owner, capacity);
 }
 
 auto CallFrame::validate_value(const LuaValue &value) const -> Result<empty> {
@@ -3656,13 +3680,6 @@ int load_table_handle(lua_State *lua) {
 int global_table_handle(lua_State *lua) {
   auto &request = *static_cast<LookupRequest *>(lua_touserdata(lua, 1));
   lua_pushglobaltable(lua);
-  request.result = luaL_ref(lua, LUA_REGISTRYINDEX);
-  return 0;
-}
-
-int create_table_handle(lua_State *lua) {
-  auto &request = *static_cast<LookupRequest *>(lua_touserdata(lua, 1));
-  lua_newtable(lua);
   request.result = luaL_ref(lua, LUA_REGISTRYINDEX);
   return 0;
 }
@@ -3715,15 +3732,17 @@ auto State::globals() -> Result<TableHandle> {
       TableHandle(make_registry_handle(rstd::move(owner), result.unwrap())));
 }
 
-auto State::create_table() -> Result<TableHandle> {
+auto State::create_table(TableCapacity capacity) -> Result<TableHandle> {
   if (!storage_)
     return Err(moved_state_error());
   auto owner = static_cast<SharedState *>(storage_)->clone();
-  auto result = perform_handle_lookup(owner, "table"_str, create_table_handle);
-  if (result.is_err())
-    return Err(rstd::move(result).unwrap_err());
-  return Ok(
-      TableHandle(make_registry_handle(rstd::move(owner), result.unwrap())));
+  auto *storage = owner.as_ptr().as_raw_ptr();
+  if (storage->executing)
+    return Err(reentrant_state_error());
+  ExecutionGuard guard(*storage);
+  auto result = make_lua_table(storage->lua, owner, capacity);
+  clear_callback_transients(storage);
+  return result;
 }
 
 auto snapshot_lua_value(lua_State *lua, int index, SharedState &owner,

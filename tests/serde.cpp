@@ -671,6 +671,40 @@ void sequence_reads(Checks &checks, luato::State &state) {
                "numbers"_str);
 }
 
+void capacities(Checks &checks, luato::State &state,
+                luato::SerializeOptions options) {
+  auto sink = luato::ValueSerializer(state, options);
+  auto invalid = usize(__INT_MAX__) + usize(1);
+  auto sequence = sink.begin_sequence(invalid);
+  auto map = sink.begin_map(invalid);
+  checks.expect(sequence.is_err() && map.is_err(),
+                "serde forwards capacity range errors");
+  state.set_memory_limit(state.used_memory().unwrap() + usize(8192)).unwrap();
+  sequence = sink.begin_sequence(usize(16384));
+  map = sink.begin_map(usize(16384));
+  state.set_memory_limit(usize()).unwrap();
+  checks.expect(sequence.is_err() && map.is_err(),
+                "serde reserves sequence and map storage at begin");
+  auto empty_sequence = sink.begin_sequence(usize()).unwrap().end().unwrap();
+  auto empty_map = sink.begin_map(usize()).unwrap().end().unwrap();
+  auto empty_record =
+      luato::to_value(state, SerdeEmptyRecord{}, options).unwrap();
+  auto read_options = options.deserialize_options();
+  checks.expect(
+      luato::from_value<rstd::json::Value>(empty_sequence, read_options)
+              .unwrap()
+              .is_Array() &&
+          luato::from_value<rstd::json::Value>(empty_map, read_options)
+              .unwrap()
+              .is_Object() &&
+          luato::from_value<rstd::json::Value>(empty_record, read_options)
+              .unwrap()
+              .is_Object(),
+      "zero capacities retain array, map and struct markers");
+  checks.expect(luato::to_value(state, request(), options).is_ok(),
+                "serde remains usable after capacity failures");
+}
+
 void failures(Checks &checks, luato::State &state,
               luato::SerializeOptions options) {
   Vec<u64> numbers;
@@ -733,6 +767,7 @@ auto expect_serde_write_contract() -> int {
   internal_enums(checks, state, options);
   callbacks(checks, state, options);
   sequence_reads(checks, state);
+  capacities(checks, state, options);
   failures(checks, state, options);
   __builtin_printf("serde write: %d assertions, %d failures\n",
                    checks.assertions, checks.failures);

@@ -302,6 +302,162 @@ void expect_metatables(Checks &checks) {
   checks.expect(cleared.is_ok() && cleared->is_none(), "metatable cleared");
 }
 
+void expect_table_capacity(Checks &checks) {
+  auto state = luato::State::create(luato::StateOptions::base()).unwrap();
+  auto source = [](ref<str> text) {
+    return lua_source("capacity"_str, "capacity:v1"_str, "capacity.lua"_str,
+                      text);
+  };
+  for (auto capacity : array<luato::TableCapacity, 4>{
+           luato::TableCapacity{}, luato::TableCapacity{.sequence = usize(64)},
+           luato::TableCapacity{.records = usize(32)},
+           luato::TableCapacity{usize(64), usize(32)}}) {
+    auto table = state.create_table(capacity).unwrap();
+    checks.expect(table.keys().unwrap().is_empty() &&
+                      table.length().unwrap() == usize() &&
+                      table.metatable().unwrap().is_none(),
+                  "table capacity does not create entries or a metatable");
+    table
+        .raw_set(luato::LuaValue::Integer(i64(1)),
+                 luato::LuaValue::Boolean(true))
+        .unwrap();
+    table
+        .raw_set(luato::LuaValue::Bytes(Vec<u8>::from("name"_bytes)),
+                 luato::LuaValue::Integer(i64(7)))
+        .unwrap();
+    checks.expect(table.keys().unwrap().len() == usize(2) &&
+                      table.length().unwrap() == usize(1),
+                  "reserved tables accept sequence and record entries");
+  }
+
+  const auto maximum = usize(__INT_MAX__);
+  for (auto capacity : array<luato::TableCapacity, 3>{
+           luato::TableCapacity{.sequence = maximum + usize(1)},
+           luato::TableCapacity{.records = maximum + usize(1)},
+           luato::TableCapacity{usize::MAX, usize::MAX}}) {
+    auto before = state.used_memory().unwrap();
+    auto result = state.create_table(capacity);
+    checks.expect(result.is_err() &&
+                      result.as_ref().unwrap_err().kind ==
+                          luato::ErrorKind::Binding &&
+                      state.used_memory().unwrap() == before,
+                  "out of range capacity is rejected before Lua allocation");
+  }
+  for (auto capacity : array<luato::TableCapacity, 2>{
+           luato::TableCapacity{.sequence = maximum},
+           luato::TableCapacity{.records = maximum}}) {
+    state.set_memory_limit(state.used_memory().unwrap() + usize(8192)).unwrap();
+    auto result = state.create_table(capacity);
+    state.set_memory_limit(usize()).unwrap();
+    checks.expect(result.is_err() && result.as_ref().unwrap_err().kind !=
+                                         luato::ErrorKind::Binding,
+                  "int maximum reaches protected Lua allocation");
+  }
+  state.set_memory_limit(state.used_memory().unwrap() + usize(8192)).unwrap();
+  auto limited = state.create_table({.sequence = usize(16384)});
+  state.set_memory_limit(usize()).unwrap();
+  checks.expect(limited.is_err() && limited.as_ref().unwrap_err().kind ==
+                                        luato::ErrorKind::Memory,
+                "reserved table allocation failure is protected");
+  checks.expect(state.create_table().is_ok(),
+                "zero argument table creation works after capacity failures");
+
+  int drops{};
+  auto module = luato::ModuleSpec("capacity_host"_Str);
+  module.raw_function(
+      "raw"_Str, usize(2), [](luato::CallFrame &frame) -> luato::BindingResult {
+        auto sequence = frame.required<i64>(usize());
+        auto records = frame.required<i64>(usize(1));
+        if (sequence.is_err())
+          return Err(rstd::move(sequence).unwrap_err());
+        if (records.is_err())
+          return Err(rstd::move(records).unwrap_err());
+        auto table = frame.new_table(
+            {usize(sequence->to_primitive()), usize(records->to_primitive())});
+        if (table.is_err())
+          return Err(rstd::move(table).unwrap_err());
+        frame.return_value(*table);
+        return Ok(usize(1));
+      });
+  module.raw_function(
+      "typed"_Str, usize(2),
+      [&state, &checks,
+       &drops](luato::CallFrame &frame) -> luato::BindingResult {
+        DropProbe probe(drops);
+        checks.expect(state.create_table({usize(1), usize(1)}).is_err(),
+                      "State table creation still rejects reentrant calls");
+        auto sequence = frame.required<i64>(usize());
+        auto records = frame.required<i64>(usize(1));
+        if (sequence.is_err())
+          return Err(rstd::move(sequence).unwrap_err());
+        if (records.is_err())
+          return Err(rstd::move(records).unwrap_err());
+        auto table = frame.create_table(
+            {usize(sequence->to_primitive()), usize(records->to_primitive())});
+        if (table.is_err())
+          return Err(rstd::move(table).unwrap_err());
+        return luato::return_value(frame,
+                                   luato::LuaValue::Table(rstd::move(*table)));
+      });
+  state.register_module(rstd::move(module)).unwrap();
+  checks.expect(
+      state
+          .execute_entry(source(
+              "for _,make in ipairs{capacity_host.raw,capacity_host.typed} do "
+              "for _,size in ipairs{{0,0},{64,0},{0,32},{64,32}} do "
+              "local t=make(size[1],size[2]); assert(next(t)==nil and #t==0); "
+              "t[1]=7; t.name='ok'; assert(t[1]==7 and t.name=='ok') end; "
+              "assert(not pcall(make,2147483648,0)); "
+              "assert(not pcall(make,0,2147483648)); "
+              "assert(next(make(0,0))==nil) end"_str))
+          .is_ok(),
+      "CallFrame table APIs preserve arguments and recover from bad "
+      "capacities");
+  auto functions =
+      state
+          .evaluate_entry(
+              source("return function() return capacity_host.raw(16384,0) end, "
+                     "function() return capacity_host.typed(0,16384) end"_str))
+          .unwrap()
+          .into_values();
+  for (usize index{}; index < functions.len(); ++index) {
+    auto before = drops;
+    state.set_memory_limit(state.used_memory().unwrap() + usize(8192)).unwrap();
+    auto result = functions[index].as_Function().value.call_values(
+        luato::MultiValue::make());
+    state.set_memory_limit(usize()).unwrap();
+    checks.expect(result.is_err() && result.as_ref().unwrap_err().kind ==
+                                         luato::ErrorKind::Memory,
+                  "both CallFrame table APIs protect allocation failure");
+    if (index == usize(1))
+      checks.expect(
+          drops == before + 1,
+          "Lua allocation failure does not bypass callback destructors");
+  }
+  checks.expect(state
+                    .execute_entry(
+                        source("assert(next(capacity_host.typed(0,0))==nil); "
+                               "assert(next(capacity_host.raw(0,0))==nil)"_str))
+                    .is_ok(),
+                "CallFrame remains usable after table OOM");
+
+  auto table = state.create_table({usize(4), usize(4)}).unwrap();
+  auto moved = rstd::move(state);
+  checks.expect(state.create_table({usize(4), usize(4)}).is_err(),
+                "capacity API rejects moved State");
+  checks.expect(table.clone().is_ok() && table.keys().is_ok() &&
+                    moved.create_table({usize(4), usize(4)}).is_ok(),
+                "capacity handle survives State move");
+  Option<luato::TableHandle> orphan;
+  {
+    auto owner = luato::State::create(luato::StateOptions::base()).unwrap();
+    orphan = Some(owner.create_table({usize(4), usize(4)}).unwrap());
+  }
+  auto cloned = orphan->clone().unwrap();
+  checks.expect(orphan->keys().is_err() && cloned.length().is_err(),
+                "capacity handle does not keep its State alive");
+}
+
 void expect_lua_ffi(Checks &checks) {
   checks.expect(LUA_VERSION_NUM == 505,
                 "Lua FFI should export version constants");
@@ -349,6 +505,10 @@ int main(int argc, char **argv) {
   if (argc == 2 && borrowed_str(argv[1]) == "--serde-capture"_str)
     return expect_serde_capture_contract();
   Checks checks;
+  if (argc == 2 && borrowed_str(argv[1]) == "--table-capacity"_str) {
+    expect_table_capacity(checks);
+    return checks.failures == 0 ? 0 : 1;
+  }
   {
     auto table = luato::Table::make();
     checks.expect(table.scalar_entries()->is_empty(),
@@ -393,6 +553,7 @@ int main(int argc, char **argv) {
 
   expect_lua_ffi(checks);
   expect_metatables(checks);
+  expect_table_capacity(checks);
   expect_module_loader(checks);
   expect_native_require_module(checks);
 

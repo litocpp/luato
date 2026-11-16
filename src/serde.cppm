@@ -117,10 +117,10 @@ public:
       return Err(invalid_value("Lua value nesting is too deep"_str));
     return Ok(empty{});
   }
-  auto table(const TableHandle *metatable)
+  auto table(const TableHandle *metatable, TableCapacity capacity = {})
       -> rstd::Result<TableHandle, SerdeError> {
-    auto result = rstd_try(
-        host(frame_ ? frame_->create_table() : state_->create_table()));
+    auto result = rstd_try(host(frame_ ? frame_->create_table(capacity)
+                                       : state_->create_table(capacity)));
     if (metatable)
       rstd_try(host(frame_ ? result.set_metatable_in_call(metatable)
                            : result.set_metatable(metatable)));
@@ -189,7 +189,8 @@ public:
   auto serialize_newtype_variant(ref<str> variant, const T &value)
       -> result_type {
     rstd_try(nested());
-    auto result = rstd_try(table(options_.object_metatable));
+    auto result =
+        rstd_try(table(options_.object_metatable, {.records = usize(1)}));
     auto sink = child(path_.with_variant(variant));
     auto encoded = rstd_try(rstd::serde::serialize(sink, value));
     auto key = rstd_try(serialize_string(variant));
@@ -200,9 +201,9 @@ public:
   auto serialize_extension(ref<str>, const T &) -> result_type {
     return Err(unsupported("Lua does not support this extension"_str));
   }
-  auto begin_sequence(usize)
+  auto begin_sequence(usize length)
       -> rstd::Result<ValueSequenceSerializer, SerdeError>;
-  auto begin_map(usize) -> rstd::Result<ValueMapSerializer, SerdeError>;
+  auto begin_map(usize length) -> rstd::Result<ValueMapSerializer, SerdeError>;
 };
 
 class ValueSequenceSerializer {
@@ -284,18 +285,18 @@ public:
   }
 };
 
-inline auto ValueSerializer::begin_sequence(usize)
+inline auto ValueSerializer::begin_sequence(usize length)
     -> rstd::Result<ValueSequenceSerializer, SerdeError> {
   rstd_try(nested());
-  auto result = rstd_try(table(options_.array_metatable));
+  auto result = rstd_try(table(options_.array_metatable, {.sequence = length}));
   auto sink = child(path_.clone());
   sink.depth_ = depth_;
   return Ok(ValueSequenceSerializer(rstd::move(sink), rstd::move(result)));
 }
-inline auto ValueSerializer::begin_map(usize)
+inline auto ValueSerializer::begin_map(usize length)
     -> rstd::Result<ValueMapSerializer, SerdeError> {
   rstd_try(nested());
-  auto result = rstd_try(table(options_.object_metatable));
+  auto result = rstd_try(table(options_.object_metatable, {.records = length}));
   auto sink = child(path_.clone());
   sink.depth_ = depth_;
   return Ok(ValueMapSerializer(rstd::move(sink), rstd::move(result)));
