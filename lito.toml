@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 name = "luato"
 module = "luato"
 archive = "luato"
-when = [{ condition = "feature.vendored", source-groups = ["lua-runtime"] }]
 
 [features.vendored]
 default = false
@@ -18,48 +17,6 @@ version = ">= 5.5"
 pub = true
 condition = "!feature.vendored"
 
-[external-sources.lua]
-archive = "https://www.lua.org/ftp/lua-5.5.1.tar.gz"
-sha256 = "1c4b4068d67061f2a2231ad2b5422e77acea1487ea9890f6320af614f4373dce"
-
-[source-groups.lua-runtime]
-external-source = "lua"
-standard = "c99"
-sources = [
-  "src/lapi.c",
-  "src/lcode.c",
-  "src/lctype.c",
-  "src/ldebug.c",
-  "src/ldo.c",
-  "src/ldump.c",
-  "src/lfunc.c",
-  "src/lgc.c",
-  "src/llex.c",
-  "src/lmem.c",
-  "src/lobject.c",
-  "src/lopcodes.c",
-  "src/lparser.c",
-  "src/lstate.c",
-  "src/lstring.c",
-  "src/ltable.c",
-  "src/ltm.c",
-  "src/lundump.c",
-  "src/lvm.c",
-  "src/lzio.c",
-  "src/lauxlib.c",
-  "src/lbaselib.c",
-  "src/lcorolib.c",
-  "src/ldblib.c",
-  "src/liolib.c",
-  "src/lmathlib.c",
-  "src/loadlib.c",
-  "src/loslib.c",
-  "src/lstrlib.c",
-  "src/ltablib.c",
-  "src/lutf8lib.c",
-  "src/linit.c",
-]
-
 [[test]]
 name = "luato-contract"
 sources = ["tests/main.cpp", "tests/i18n.cpp", "tests/typed.cpp", "tests/async.cpp", "tests/userdata.cpp", "tests/serde.cpp", "tests/serde_capture.cpp", "tests/memory.cpp"]
@@ -69,24 +26,12 @@ private-definitions = [
   "LUATO_FIXTURE_DIR=\"tests/fixtures\"",
 ]
 
-[[when]]
-condition = "feature.vendored"
-
-[when.usage]
-public-include-directories = [{ external-source = "lua", path = "src" }]
-
-[[when]]
-condition = 'feature.vendored && target.os == "linux"'
-
-[when.usage]
-private-definitions = ["LUA_USE_LINUX"]
-system-libraries = ["dl", "m"]
-
 [profile.base]
 exceptions = false
 rtti = false
 
 [dependencies]
+lua = { version = "5.5.1", pub = true, condition = "feature.vendored" }
 rstd-std = { version = "0.1.13", pub = true }
 rstd-parse = { version = "0.1.13", pub = true }
 rstd-serde = { version = "0.1.13", pub = true }
