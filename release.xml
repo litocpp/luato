@@ -1,3 +1,11 @@
+<release version="0.1.4" date="2026-11-18">
+  <description>
+    <ul>
+      <li>Use packaged Lua for vendored builds.</li>
+      <li>Move Lua state, binding and serde implementations out of module interfaces.</li>
+    </ul>
+  </description>
+</release>
 <release version="0.1.3" date="2026-11-17">
   <description>
     <ul>
